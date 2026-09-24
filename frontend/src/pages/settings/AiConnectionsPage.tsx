@@ -143,7 +143,7 @@ export function AiConnectionsPage() {
               className={`provider-card ${provider === 'opencode' ? 'selected' : ''}`}
               onClick={() => {
                 setProvider('opencode')
-                setModel('opencode/free')
+                setModel('muse-spark-1.3-contributor-free')
               }}
               role="button"
               tabIndex={0}
@@ -152,7 +152,7 @@ export function AiConnectionsPage() {
               }}
             >
               <strong>OpenCode</strong>
-              <small>Zen free tier models. Simple and open.</small>
+              <small>OpenCode Zen, including Muse Spark 1.3 Contributor Free.</small>
             </div>
 
             <div
@@ -227,6 +227,24 @@ export function AiConnectionsPage() {
                 </button>
               ))}
             </div>
+          </div>
+        )}
+
+        {provider === 'opencode' && (
+          <div className="field">
+            <span>OpenCode Zen models</span>
+            <div className="model-pills" role="radiogroup" aria-label="OpenCode Zen models">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={model === 'muse-spark-1.3-contributor-free'}
+                className={`model-pill ${model === 'muse-spark-1.3-contributor-free' ? 'active' : ''}`}
+                onClick={() => setModel('muse-spark-1.3-contributor-free')}
+              >
+                Muse Spark 1.3 Contributor Free
+              </button>
+            </div>
+            <small>Free tier. OpenCode may use prompts and completions from this model to train future models.</small>
           </div>
         )}
 

@@ -168,6 +168,37 @@ def test_invalid_ai_key_has_actionable_error(monkeypatch):
     with pytest.raises(ValueError, match='Replace it in Connections, or use local CV preparation'):
         providers.ask(Dummy, 'Return JSON.', {'test': 'synthetic'})
 
+
+def test_opencode_uses_cli_and_cleans_temporary_request(tmp_path, monkeypatch):
+    import subprocess
+    from pathlib import Path
+    from pydantic import BaseModel
+
+    class Dummy(BaseModel):
+        answer: str
+
+    monkeypatch.setattr(store, 'DATA', tmp_path)
+    monkeypatch.setattr(providers, '_opencode_executable', lambda: ['opencode'])
+    observed = {}
+
+    def fake_run(command, **kwargs):
+        prompt_path = Path(command[command.index('--file') + 1])
+        observed['prompt'] = prompt_path.read_text(encoding='utf-8')
+        observed['model'] = command[command.index('--model') + 1]
+        observed['api_key'] = kwargs['env']['OPENCODE_API_KEY']
+        assert prompt_path.exists()
+        return subprocess.CompletedProcess(command, 0, '{"answer":"synthetic"}', '')
+
+    monkeypatch.setattr(providers.subprocess, 'run', fake_run)
+    config = {'key': 'synthetic-key', 'model': 'muse-spark-1.3-contributor-free'}
+    result = providers._ask_opencode(Dummy, 'Answer from the input.', {'value': 'synthetic'}, config)
+
+    assert result == Dummy(answer='synthetic')
+    assert observed['model'] == 'opencode/muse-spark-1.3-contributor-free'
+    assert observed['api_key'] == 'synthetic-key'
+    assert 'synthetic' in observed['prompt']
+    assert list((tmp_path / 'tmp').iterdir()) == []
+
 def test_search_preferences_sync_and_ranking(client, monkeypatch):
     """Test instant sync of preferences on search request and score ranking."""
     class MockResponse:

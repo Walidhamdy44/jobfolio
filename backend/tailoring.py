@@ -30,6 +30,28 @@ def extract_requirements(description, ai):
                 matched = any(' '.join(words[i:i+4]) in desc_norm for i in range(max(1, len(words)-3))) if len(words) >= 4 else False
                 if not matched:
                     raise ValueError('Requirement extraction did not preserve source quotes. Please try again or use local preparation.')
+        # AI extraction can omit explicit checklist items. Supplement it with
+        # verbatim criteria from recognizable source sections so the review
+        # denominator never silently drops requirements that are in the posting.
+        try:
+            local_rows = extract_requirements(description, ai=False)
+        except ValueError:
+            local_rows = []
+        for local in local_rows:
+            local_tokens = tokens(local['text'])
+            represented = False
+            for ai_row in rows:
+                ai_tokens = tokens(ai_row['text'])
+                if not local_tokens or not ai_tokens:
+                    represented = normalized(local['text']) in normalized(ai_row['text']) or normalized(ai_row['text']) in normalized(local['text'])
+                else:
+                    represented = len(local_tokens & ai_tokens) / min(len(local_tokens), len(ai_tokens)) >= 0.82
+                if represented:
+                    if local['priority'] == 'required':
+                        ai_row['priority'] = 'required'
+                    break
+            if not represented:
+                rows.append(local)
     else:
         rows = []
         current_priority = None

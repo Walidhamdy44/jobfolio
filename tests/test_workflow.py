@@ -214,6 +214,26 @@ Develop your skills while experiencing excellent benefits and collaboration.
     assert all('employer' not in row['text'].lower() and 'benefits' not in row['text'].lower() for row in rows)
 
 
+def test_ai_extraction_keeps_explicit_requirements_it_omits(monkeypatch):
+    description = """Responsibilities
+Build React web applications and maintain frontend components.
+Required Skills
+Strong experience with React, TypeScript, AWS Lambda and CloudWatch monitoring systems.
+Preferred Skills
+Experience with Storybook and component testing.
+"""
+    quoted = 'Build React web applications and maintain frontend components.'
+    result = providers.Requirements(requirements=[providers.Requirement(
+        text=quoted, priority='required', source_quote=quoted,
+    )])
+    monkeypatch.setattr(providers, 'ask', lambda *args, **kwargs: result)
+    rows = tailoring.extract_requirements(description, ai=True)
+    texts = [row['text'] for row in rows]
+    assert len(rows) == 3
+    assert any('AWS Lambda' in text for text in texts)
+    assert any('Storybook' in text and row['priority'] == 'preferred' for text, row in zip(texts, rows))
+
+
 def test_prepare_fetches_full_description_before_queueing(client, monkeypatch):
     brief = 'LinkedIn search summary for a frontend position in Cairo.'
     job, _ = store.add_job({

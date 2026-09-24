@@ -1,6 +1,11 @@
 import os
 import json
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel, Field
 from . import store
@@ -29,7 +34,7 @@ def save_secret(name, value):
 DEFAULT_MODELS = {
     'openrouter': 'minimax/minimax-m3:free',
     'tokenrouter': 'z-ai/glm-5.3-free',
-    'opencode': 'opencode/free',
+    'opencode': 'muse-spark-1.3-contributor-free',
     'openai': 'gpt-4o-mini',
     'custom': 'minimax/minimax-m3:free',
 }
@@ -37,7 +42,7 @@ DEFAULT_MODELS = {
 DEFAULT_BASE_URLS = {
     'openrouter': 'https://openrouter.ai/api/v1',
     'tokenrouter': 'https://api.tokenrouter.io/v1',
-    'opencode': 'https://api.opencode.ai/v1',
+    'opencode': 'https://opencode.ai/zen/v1',
     'openai': 'https://api.openai.com/v1',
     'custom': 'http://localhost:11434/v1',
 }
@@ -80,7 +85,10 @@ def get_provider_config():
 
     default_model = DEFAULT_MODELS.get(provider, 'meta-llama/llama-3.3-70b-instruct:free')
     model = store.setting('model', default_model)
-    if not model:
+    if provider == 'opencode' and model == 'opencode/free':
+        model = default_model
+        store.set_setting('model', model)
+    elif not model:
         model = default_model
 
     # Custom provider may not strictly require an API key (e.g. local Ollama)
@@ -162,6 +170,76 @@ def _clean_json_markdown(text: str) -> str:
         return match.group(1).strip()
     return ''
 
+
+def _opencode_executable() -> list[str]:
+    """Resolve OpenCode's installed CLI without invoking a shell."""
+    executable = shutil.which('opencode.exe') or shutil.which('opencode')
+    if not executable:
+        raise ValueError('OpenCode CLI was not found. Install OpenCode or choose another AI provider.')
+
+    path = Path(executable)
+    if sys.platform == 'win32' and path.suffix.casefold() in ('.cmd', '.ps1'):
+        bundled = path.parent / 'node_modules' / 'opencode-ai' / 'bin' / 'opencode.exe'
+        if bundled.is_file():
+            return [str(bundled)]
+        shell = shutil.which('powershell.exe')
+        if path.suffix.casefold() == '.ps1' and shell:
+            return [shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(path)]
+        raise ValueError('OpenCode CLI launcher was found, but its executable could not be resolved.')
+    return [executable]
+
+
+def _ask_opencode(schema, instruction, payload, cfg):
+    """Use OpenCode's supported CLI route; some Zen free models reject direct API clients."""
+    root = Path(store.ROOT).resolve()
+    temp_dir = Path(store.DATA) / 'tmp'
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+    prompt = (
+        f'{instruction}\n\n'
+        'Return only one valid JSON object matching this schema. Do not include commentary.\n'
+        f'Schema:\n{schema_json}\n\n'
+        f'Input data:\n{json.dumps(payload, ensure_ascii=False)}'
+    )
+    prompt_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8', suffix='.txt', prefix='opencode-request-',
+            dir=temp_dir, delete=False,
+        ) as request_file:
+            request_file.write(prompt)
+            prompt_path = Path(request_file.name)
+
+        model_id = cfg['model'].removeprefix('opencode/')
+        env = os.environ.copy()
+        env['OPENCODE_API_KEY'] = cfg['key']
+        command = _opencode_executable() + [
+            'run',
+            'Read the attached request and return only the requested JSON object.',
+            '--model', f'opencode/{model_id}',
+            '--format', 'default',
+            '--dir', str(root),
+            '--file', str(prompt_path),
+        ]
+        result = subprocess.run(
+            command, cwd=str(root), env=env, capture_output=True, text=True,
+            timeout=120, check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError('OpenCode CLI could not complete the request. Check OpenCode login, model access, and connection.')
+        clean_text = _clean_json_markdown(result.stdout)
+        if not clean_text:
+            raise ValueError('OpenCode did not return valid JSON. Try again or use local CV preparation.')
+        try:
+            return schema.model_validate_json(clean_text)
+        except Exception as exc:
+            raise ValueError('OpenCode returned JSON that does not match the expected response. Try again or use local CV preparation.') from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError('OpenCode timed out. Check its status and retry, or use local CV preparation.') from exc
+    finally:
+        if prompt_path is not None:
+            prompt_path.unlink(missing_ok=True)
+
 def ask(schema, instruction, payload):
     from openai import OpenAI
     import openai
@@ -175,6 +253,9 @@ def ask(schema, instruction, payload):
     if not key and provider != 'custom':
         provider_name = PROVIDER_DISPLAY_NAMES.get(provider, provider.capitalize())
         raise ValueError(f'Connect an API key for {provider_name} in Settings to use AI tailoring.')
+
+    if provider == 'opencode':
+        return _ask_opencode(schema, instruction, payload, cfg)
 
     default_headers = {}
     if provider == 'openrouter':
@@ -206,6 +287,19 @@ def ask(schema, instruction, payload):
     ]
 
     try:
+        if provider == 'opencode':
+            response = client.responses.parse(
+                model=model,
+                instructions=system_prompt,
+                input=messages[1]['content'],
+                text_format=schema,
+                store=False,
+                temperature=0.1,
+            )
+            if response.output_parsed is None:
+                raise ValueError('OpenCode did not return a valid structured response. Try again or use local preparation.')
+            return response.output_parsed
+
         kwargs = {'temperature': 0.1}
         if provider == 'openai':
             kwargs['response_format'] = {'type': 'json_object'}

@@ -213,7 +213,7 @@ def test_scenario_7_provider_configuration_and_switching(client):
     providers_to_test = [
         ('openrouter', 'openrouter/free', 'https://openrouter.ai/api/v1/'),
         ('tokenrouter', 'z-ai/glm-5.3-free', 'https://api.tokenrouter.io/v1'),
-        ('opencode', 'opencode/free', 'https://api.opencode.ai/v1'),
+        ('opencode', 'muse-spark-1.3-contributor-free', 'https://opencode.ai/zen/v1'),
         ('custom', 'llama3.2', 'http://localhost:11434/v1')
     ]
 
