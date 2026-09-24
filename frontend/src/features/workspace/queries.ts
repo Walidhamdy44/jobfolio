@@ -11,7 +11,7 @@ export const workspaceKeys = {
 
 export function useBootstrapQuery() {
   const qc = useQueryClient()
-  const prevActiveRef = useRef<boolean>(false)
+  const previousRunStates = useRef<Map<string, string> | null>(null)
 
   const query = useQuery<Bootstrap>({
     queryKey: workspaceKeys.bootstrap,
@@ -20,19 +20,23 @@ export function useBootstrapQuery() {
       const data = q.state.data
       if (!data) return false
       const hasActiveRun = data.runs?.some((r) => ['queued', 'running'].includes(r.state))
-      return hasActiveRun ? 1000 : false
+      return hasActiveRun ? 5000 : false
     },
   })
 
   useEffect(() => {
     const data = query.data
     if (!data) return
-    const hasActiveRun = data.runs?.some((r) => ['queued', 'running'].includes(r.state))
-    if (prevActiveRef.current && !hasActiveRun) {
-      // Active run finished! Invalidate all job queries so detail views immediately reflect new packages/status
+    const currentRunStates = new Map(data.runs?.map((run) => [run.id, run.state]) ?? [])
+    const finishedRun = previousRunStates.current && data.runs?.some((run) =>
+      ['completed', 'failed', 'interrupted'].includes(run.state) &&
+      previousRunStates.current?.get(run.id) !== run.state
+    )
+    if (finishedRun) {
+      // A fast run may finish between polls, so detect newly seen terminal runs too.
       void qc.invalidateQueries({ queryKey: jobKeys.all })
     }
-    prevActiveRef.current = Boolean(hasActiveRun)
+    previousRunStates.current = currentRunStates
   }, [query.data, qc])
 
   return query

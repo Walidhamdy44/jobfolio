@@ -9,7 +9,6 @@ export const jobKeys = {
 }
 
 export function useJobDetailQuery(jobId?: string) {
-  const qc = useQueryClient()
   return useQuery<Detail>({
     queryKey: jobKeys.detail(jobId || ''),
     queryFn: ({ signal }) => {
@@ -19,16 +18,6 @@ export function useJobDetailQuery(jobId?: string) {
     enabled: Boolean(jobId),
     staleTime: 0,
     refetchOnMount: 'always',
-    refetchInterval: () => {
-      // Check if there is an active run targeting this job
-      const bootstrap = qc.getQueryData<{ runs?: { target: string | null; state: string }[] }>(
-        workspaceKeys.bootstrap
-      )
-      const isJobRunning = bootstrap?.runs?.some(
-        (r) => r.target === jobId && ['queued', 'running'].includes(r.state)
-      )
-      return isJobRunning ? 1000 : false
-    },
   })
 }
 

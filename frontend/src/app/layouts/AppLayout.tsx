@@ -15,10 +15,20 @@ import { Notice } from '../../shared/ui/Notice'
 
 export function AppLayout() {
   const location = useLocation()
-  const { data, isLoading, error, refetch, isFetching } = useBootstrapQuery()
+  const { data, isLoading, error, refetch } = useBootstrapQuery()
 
   const [dismissedRun, setDismissedRun] = useState<string>('')
   const [toast, setToast] = useState<string>('')
+  const [isManualRefreshing, setIsManualRefreshing] = useState(false)
+
+  const handleManualRefresh = async () => {
+    setIsManualRefreshing(true)
+    try {
+      await refetch()
+    } finally {
+      setIsManualRefreshing(false)
+    }
+  }
 
   useEffect(() => {
     if (toast) {
@@ -141,12 +151,12 @@ export function AppLayout() {
               type="button"
               className="icon-button"
               title="Refresh workspace data"
-              onClick={() => void refetch()}
+              onClick={() => void handleManualRefresh()}
               aria-label="Refresh workspace data"
-              disabled={isFetching}
+              disabled={isManualRefreshing}
               style={{ padding: '6px', marginRight: '4px' }}
             >
-              <RefreshCw size={14} className={isFetching ? 'spin' : ''} />
+              <RefreshCw size={14} className={isManualRefreshing ? 'spin' : ''} />
             </button>
             <span className="connection-dot" aria-hidden="true" />
             <span>Local workspace</span>
