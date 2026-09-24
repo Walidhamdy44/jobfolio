@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import httpx
 from typing import Literal
 from pydantic import BaseModel, Field
 from . import store
@@ -73,9 +74,6 @@ def get_provider_config():
     # If using openai or fallback key
     if not key and provider == 'openai':
         key = secret('OPENAI_API_KEY')
-    elif not key and provider == 'openrouter':
-        # check if OPENROUTER_API_KEY or OPENAI_API_KEY is available
-        key = secret('OPENROUTER_API_KEY') or secret('OPENAI_API_KEY')
 
     if provider == 'custom':
         base_url = store.setting('custom_base_url') or store.setting('base_url') or DEFAULT_BASE_URLS['custom']
@@ -102,6 +100,25 @@ def get_provider_config():
         'connected': connected,
         'secret_name': secret_name,
     }
+
+
+def validate_openrouter_key(key: str) -> None:
+    """Check the saved credential before queueing work that would share CV data."""
+    if not key:
+        raise ValueError('Connect an OpenRouter API key in Connections, or use local CV preparation.')
+    try:
+        response = httpx.get(
+            'https://openrouter.ai/api/v1/key',
+            headers={'Authorization': f'Bearer {key}'},
+            timeout=15,
+            trust_env=False,
+        )
+    except httpx.HTTPError as exc:
+        raise ValueError('Could not verify the OpenRouter key. Check the connection and try again.') from exc
+    if response.status_code == 401:
+        raise ValueError('OpenRouter rejected the saved API key (401). Create a new key in OpenRouter and replace it in Connections, or use local CV preparation.')
+    if response.status_code != 200:
+        raise ValueError(f'OpenRouter key check returned HTTP {response.status_code}. Check key access in OpenRouter before tailoring.')
 
 class Requirement(BaseModel):
     text: str
@@ -164,10 +181,17 @@ def _clean_json_markdown(text: str) -> str:
         fence_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text, re.IGNORECASE)
         if fence_match:
             text = fence_match.group(1).strip()
-    # Extract the outermost JSON object {...} or array [...]
-    match = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', text)
-    if match:
-        return match.group(1).strip()
+    # Decode one complete object instead of greedily consuming adjacent JSON
+    # blocks or commentary after a valid response.
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in '{[':
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        return json.dumps(value, ensure_ascii=False)
     return ''
 
 
@@ -191,54 +215,58 @@ def _opencode_executable() -> list[str]:
 
 def _ask_opencode(schema, instruction, payload, cfg):
     """Use OpenCode's supported CLI route; some Zen free models reject direct API clients."""
-    root = Path(store.ROOT).resolve()
-    temp_dir = Path(store.DATA) / 'tmp'
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_root = Path(store.DATA) / 'tmp'
+    temp_root.mkdir(parents=True, exist_ok=True)
     schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
     prompt = (
         f'{instruction}\n\n'
-        'Return only one valid JSON object matching this schema. Do not include commentary.\n'
+        'Return only one valid JSON object matching this schema. Do not use tools or include commentary.\n'
         f'Schema:\n{schema_json}\n\n'
         f'Input data:\n{json.dumps(payload, ensure_ascii=False)}'
     )
-    prompt_path = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode='w', encoding='utf-8', suffix='.txt', prefix='opencode-request-',
-            dir=temp_dir, delete=False,
-        ) as request_file:
-            request_file.write(prompt)
-            prompt_path = Path(request_file.name)
-
-        model_id = cfg['model'].removeprefix('opencode/')
-        env = os.environ.copy()
-        env['OPENCODE_API_KEY'] = cfg['key']
-        command = _opencode_executable() + [
-            'run',
-            'Read the attached request and return only the requested JSON object.',
-            '--model', f'opencode/{model_id}',
-            '--format', 'default',
-            '--dir', str(root),
-            '--file', str(prompt_path),
-        ]
-        result = subprocess.run(
-            command, cwd=str(root), env=env, capture_output=True, text=True,
-            timeout=120, check=False,
-        )
-        if result.returncode != 0:
-            raise ValueError('OpenCode CLI could not complete the request. Check OpenCode login, model access, and connection.')
-        clean_text = _clean_json_markdown(result.stdout)
-        if not clean_text:
-            raise ValueError('OpenCode did not return valid JSON. Try again or use local CV preparation.')
-        try:
-            return schema.model_validate_json(clean_text)
-        except Exception as exc:
-            raise ValueError('OpenCode returned JSON that does not match the expected response. Try again or use local CV preparation.') from exc
+        with tempfile.TemporaryDirectory(prefix='opencode-request-', dir=temp_root) as folder:
+            request_dir = Path(folder)
+            prompt_path = request_dir / 'request.txt'
+            model_id = cfg['model'].removeprefix('opencode/')
+            env = os.environ.copy()
+            env['OPENCODE_API_KEY'] = cfg['key']
+            command = _opencode_executable() + [
+                'run',
+                'Read the attached request and return only its JSON object. Do not use tools.',
+                '--agent', 'plan',
+                '--model', f'opencode/{model_id}',
+                '--format', 'json',
+                '--dir', str(request_dir),
+                '--file', str(prompt_path),
+            ]
+            for attempt in range(2):
+                suffix = '' if attempt == 0 else '\n\nRETRY: The prior response was not valid JSON for the supplied schema. Return only the JSON object.'
+                prompt_path.write_text(prompt + suffix, encoding='utf-8')
+                result = subprocess.run(
+                    command, cwd=str(request_dir), env=env, capture_output=True,
+                    text=True, timeout=120, check=False,
+                )
+                if result.returncode != 0:
+                    raise ValueError('OpenCode CLI could not complete the request. Check OpenCode login, model access, and connection.')
+                response_parts = []
+                for line in result.stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    part = event.get('part') or {}
+                    if event.get('type') == 'text' and part.get('type') == 'text':
+                        response_parts.append(part.get('text', ''))
+                clean_text = _clean_json_markdown('\n'.join(response_parts))
+                if clean_text:
+                    try:
+                        return schema.model_validate_json(clean_text)
+                    except Exception:
+                        pass
+            raise ValueError('OpenCode did not return valid JSON for the expected schema after retrying. Use local CV preparation or another model.')
     except subprocess.TimeoutExpired as exc:
         raise ValueError('OpenCode timed out. Check its status and retry, or use local CV preparation.') from exc
-    finally:
-        if prompt_path is not None:
-            prompt_path.unlink(missing_ok=True)
 
 def ask(schema, instruction, payload):
     from openai import OpenAI
@@ -287,19 +315,6 @@ def ask(schema, instruction, payload):
     ]
 
     try:
-        if provider == 'opencode':
-            response = client.responses.parse(
-                model=model,
-                instructions=system_prompt,
-                input=messages[1]['content'],
-                text_format=schema,
-                store=False,
-                temperature=0.1,
-            )
-            if response.output_parsed is None:
-                raise ValueError('OpenCode did not return a valid structured response. Try again or use local preparation.')
-            return response.output_parsed
-
         kwargs = {'temperature': 0.1}
         if provider == 'openai':
             kwargs['response_format'] = {'type': 'json_object'}

@@ -169,7 +169,19 @@ def test_invalid_ai_key_has_actionable_error(monkeypatch):
         providers.ask(Dummy, 'Return JSON.', {'test': 'synthetic'})
 
 
+def test_openrouter_key_check_rejects_401_without_cv_data(monkeypatch):
+    def fake_get(url, **kwargs):
+        assert url.endswith('/api/v1/key')
+        assert kwargs['headers']['Authorization'] == 'Bearer synthetic-invalid-key'
+        return httpx.Response(401, request=httpx.Request('GET', url))
+
+    monkeypatch.setattr(providers.httpx, 'get', fake_get)
+    with pytest.raises(ValueError, match='Create a new key in OpenRouter'):
+        providers.validate_openrouter_key('synthetic-invalid-key')
+
+
 def test_opencode_uses_cli_and_cleans_temporary_request(tmp_path, monkeypatch):
+    import json
     import subprocess
     from pathlib import Path
     from pydantic import BaseModel
@@ -187,7 +199,11 @@ def test_opencode_uses_cli_and_cleans_temporary_request(tmp_path, monkeypatch):
         observed['model'] = command[command.index('--model') + 1]
         observed['api_key'] = kwargs['env']['OPENCODE_API_KEY']
         assert prompt_path.exists()
-        return subprocess.CompletedProcess(command, 0, '{"answer":"synthetic"}', '')
+        assert command[command.index('--agent') + 1] == 'plan'
+        assert command[command.index('--format') + 1] == 'json'
+        assert kwargs['cwd'] == str(prompt_path.parent)
+        event = {'type': 'text', 'part': {'type': 'text', 'text': '```json\n{"answer":"synthetic"}\n```'}}
+        return subprocess.CompletedProcess(command, 0, json.dumps(event), '')
 
     monkeypatch.setattr(providers.subprocess, 'run', fake_run)
     config = {'key': 'synthetic-key', 'model': 'muse-spark-1.3-contributor-free'}
@@ -198,6 +214,35 @@ def test_opencode_uses_cli_and_cleans_temporary_request(tmp_path, monkeypatch):
     assert observed['api_key'] == 'synthetic-key'
     assert 'synthetic' in observed['prompt']
     assert list((tmp_path / 'tmp').iterdir()) == []
+
+
+def test_opencode_retries_invalid_model_text_once(tmp_path, monkeypatch):
+    import json
+    import subprocess
+    from pydantic import BaseModel
+
+    class Dummy(BaseModel):
+        answer: str
+
+    monkeypatch.setattr(store, 'DATA', tmp_path)
+    monkeypatch.setattr(providers, '_opencode_executable', lambda: ['opencode'])
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(1)
+        text = 'I cannot produce JSON.' if len(calls) == 1 else '{"answer":"recovered"}'
+        event = {'type': 'text', 'part': {'type': 'text', 'text': text}}
+        return subprocess.CompletedProcess(command, 0, json.dumps(event), '')
+
+    monkeypatch.setattr(providers.subprocess, 'run', fake_run)
+    result = providers._ask_opencode(Dummy, 'Reply as JSON.', {}, {'key': 'synthetic-key', 'model': 'muse-spark-1.3-contributor-free'})
+    assert result.answer == 'recovered'
+    assert len(calls) == 2
+    assert list((tmp_path / 'tmp').iterdir()) == []
+
+
+def test_json_extraction_does_not_consume_adjacent_objects():
+    assert providers._clean_json_markdown('before {"answer":"yes"} after {"other":1}') == '{"answer": "yes"}'
 
 def test_search_preferences_sync_and_ranking(client, monkeypatch):
     """Test instant sync of preferences on search request and score ranking."""

@@ -78,6 +78,17 @@ def test_missing_api_keys_clear_error(client,job):
     assert r.status_code==400 and 'Connect an API key' in r.json()['detail']
     assert client.get('/api/workspace').json()['search_results']['items']==[]
 
+
+def test_openrouter_key_is_checked_before_ai_preparation(client, job, monkeypatch):
+    monkeypatch.setattr(providers, 'get_provider_config', lambda: {
+        'provider': 'openrouter', 'connected': True, 'key': 'synthetic-invalid-key',
+    })
+    monkeypatch.setattr(providers, 'validate_openrouter_key', lambda key: (_ for _ in ()).throw(ValueError('OpenRouter rejected the saved API key (401).')))
+    monkeypatch.setattr(worker, 'enqueue', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('No AI run should be queued')))
+    response = client.post(f"/api/jobs/{job['id']}/prepare", json={'mode': 'ai'})
+    assert response.status_code == 400
+    assert 'OpenRouter rejected' in response.json()['detail']
+
 def test_csrf_and_dns_rebinding(client):
     r=client.post('/api/search',headers={'Origin':'https://evil.example'})
     assert r.status_code==403

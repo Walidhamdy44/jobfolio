@@ -394,6 +394,8 @@ def prepare_job(job_id:str,body:PrepareInput):
         if not cfg['connected']:
             p_name = providers.PROVIDER_DISPLAY_NAMES.get(cfg['provider'], cfg['provider'].capitalize())
             raise ValueError(f'Connect an API key for {p_name} in Settings first, or use local preparation.')
+        if cfg['provider'] == 'openrouter':
+            providers.validate_openrouter_key(cfg['key'])
     return {'run_id':worker.enqueue('prepare',job_id,lambda progress=None:tailoring.prepare(job_id,body.mode,progress=progress))}
 
 @app.post('/api/jobs/{job_id}/inspect')
