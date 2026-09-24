@@ -1,0 +1,32 @@
+:root {
+  /* Color Palette */
+  --color-text: #253a35;
+  --color-text-muted: #65736e;
+  --color-action: #246952;
+  --color-action-hover: #1d5543;
+  --color-sidebar: #173e32;
+  --color-sidebar-hover: #284e40;
+  --color-sidebar-active: #36604c;
+  --color-border: #dde5e0;
+  --color-canvas: #f5f7f6;
+  --color-surface: #ffffff;
+  --color-focus: #467d62;
+  --color-focus-on-dark: #b2d8bf;
+
+  /* Status Tokens */
+  --color-success: #355e35;
+  --color-success-bg: #e2efdd;
+  --color-warning: #765721;
+  --color-warning-bg: #f5ecd8;
+  --color-error: #8c453b;
+  --color-error-bg: #f6e7e3;
+  --color-info: #45614b;
+  --color-info-bg: #eaf0e8;
+
+  /* Typography & Layout */
+  --font-sans: 'Manrope Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --ease: cubic-bezier(.16, 1, .3, 1);
+}
