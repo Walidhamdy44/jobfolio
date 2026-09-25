@@ -299,7 +299,7 @@ export function JobApplicationPage() {
 
           {job.url && (
             <a className="text-button" href={job.url} target="_blank" rel="noreferrer">
-              Continue on employer site
+              Open employer site in a new tab (manual)
               <ExternalLink size={14} />
             </a>
           )}
@@ -310,7 +310,7 @@ export function JobApplicationPage() {
               AI Auto-Apply Co-Pilot
             </h4>
             <p className="small" style={{ marginBottom: '10px' }}>
-              Opens the job in a browser with your saved logins, fills supported answers, and uploads your tailored CV. Review unanswered screening and salary questions yourself.
+              Opens a separate controlled browser window, fills supported answers, and uploads your tailored CV. It stays open when you need to answer a question or review the form before submission.
             </p>
 
             <label className="check-field" style={{ margin: '8px 0 14px', fontSize: '11px' }}>
@@ -347,7 +347,7 @@ export function JobApplicationPage() {
               disabled={openSessionMutation.isPending}
             >
               <ExternalLink size={13} />
-              Open browser to log into LinkedIn / Job site
+              Open the separate agent browser to sign in
             </button>
           </div>
         </aside>

@@ -1,4 +1,6 @@
 import pytest
+from unittest.mock import MagicMock
+from playwright.sync_api import sync_playwright
 from backend import store, form_engine, browser
 
 def test_form_engine_contact_resolution():
@@ -129,6 +131,61 @@ def test_contact_field_country_code_disambiguation():
     profile = {'phone': '+20 100 123 4567', 'location': 'Cairo, Egypt'}
     assert form_engine.resolve_contact_field('Phone Country Code', profile) == '+20'
     assert form_engine.resolve_contact_field('Mobile Phone', profile) == '+20 100 123 4567'
+    assert form_engine.answer_single_field(
+        {
+            'label': 'Phone Country Code', 'type': 'select',
+            'options': [
+                {'label': 'Egypt (+20)', 'value': 'eg'},
+                {'label': 'United States (+1)', 'value': 'us'},
+            ],
+        },
+        profile, {}, {}, {},
+    ) == 'eg'
+
+
+def test_copilot_keeps_browser_open_for_missing_input(client, job):
+    page = MagicMock()
+    page.is_closed.return_value = False
+    progress = []
+    message = 'Complete expected salary in the employer form.'
+
+    result = browser._handoff_to_user(page, job['id'], message, progress.append)
+
+    assert result == message
+    assert store.get_job(job['id'])['state'] == 'needs_input'
+    assert store.get_job(job['id'])['input_request'] == message
+    assert progress == [f'Input needed: {message}']
+    page.wait_for_event.assert_called_once_with('close', timeout=0)
+
+
+def test_copilot_fills_known_contact_and_flags_unknown_required_field(client, job):
+    html = '''<label for="phone">Mobile phone *</label><input id="phone" type="tel" required>
+    <label for="salary">Expected salary *</label><input id="salary" required>'''
+    with sync_playwright() as playwright:
+        chromium = playwright.chromium.launch(headless=True)
+        try:
+            page = chromium.new_page()
+            page.set_content(html)
+            profile = {'phone': '+20 100 123 4567', 'name': 'Jane Doe'}
+            unresolved = browser._fill_container_fields(page, page, profile, job, {'answers': {}}, {})
+            assert page.locator('#phone').input_value() == profile['phone']
+            assert 'Expected salary *' in unresolved
+            assert browser._unresolved_required_fields(page, page) == ['Expected salary *']
+        finally:
+            chromium.close()
+
+
+def test_linkedin_native_dialog_is_recognized():
+    with sync_playwright() as playwright:
+        chromium = playwright.chromium.launch(headless=True)
+        try:
+            page = chromium.new_page()
+            page.set_content('<dialog open><h2>Apply to SAQAYA</h2><input required></dialog>')
+            modal = page.locator(browser.EASY_APPLY_MODAL_SELECTOR).first
+            assert modal.is_visible()
+            assert modal.locator('h2').inner_text() == 'Apply to SAQAYA'
+        finally:
+            chromium.close()
 
 def test_auto_apply_unapproved_package_rejected(client):
     # AA-02: Endpoint must reject unapproved or unreviewed packages

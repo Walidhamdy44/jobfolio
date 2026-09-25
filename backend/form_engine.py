@@ -281,6 +281,8 @@ def answer_single_field(field: dict, profile: dict, job: dict, package: dict, pr
     # 1. Contact / Profile identity
     contact_val = resolve_contact_field(label, profile)
     if contact_val is not None:
+        if options:
+            return match_dropdown_option(options, contact_val) or ''
         return contact_val
 
     # 2. Work authorization / Sponsorship

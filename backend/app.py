@@ -504,10 +504,10 @@ def resolve(job_id:str,body:Resolution):
     with store.db() as c:
         if c.execute("SELECT id FROM runs WHERE target=? AND state IN ('queued','running')",(job_id,)).fetchone(): raise ValueError('Wait for the current operation to finish.')
     if body.status=='submitted':
-        store.update_job(job_id,state='submitted',receipt={'text':body.note,'at':store.now(),'url':job.get('url',''),'manual':True})
+        store.update_job(job_id,state='submitted',input_request=None,receipt={'text':body.note,'at':store.now(),'url':job.get('url',''),'manual':True})
     else:
         if job['state']=='submitted': raise ValueError('A confirmed submitted application cannot be reset for resubmission.')
-        store.update_job(job_id,state='awaiting_review' if store.get_package(job_id) else 'shortlisted')
+        store.update_job(job_id,state='awaiting_review' if store.get_package(job_id) else 'shortlisted',input_request=None)
         with store.db() as c: c.execute('UPDATE packages SET approved_hash=NULL WHERE job_id=?',(job_id,))
     store.event(job_id,'You recorded '+body.status.replace('_',' ')+': '+body.note)
     return {'ok':True}

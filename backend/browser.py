@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 from . import store, network
 
+EASY_APPLY_MODAL_SELECTOR = 'dialog[open], div[role="dialog"], .jobs-easy-apply-modal'
+
 FIELDS_JS = r'''() => {
  const els=[...document.querySelectorAll('input,textarea,select')];
  return els.filter(e => e.type !== 'hidden' && e.type !== 'submit' && e.type !== 'button' && (e.type==='file' || e.getClientRects().length)).map((e,index)=>{
@@ -215,6 +217,39 @@ def _safe_count(locator) -> int:
     except Exception:
         return 0
 
+
+def _handoff_to_user(page, job_id: str, message: str, progress=None, *, needs_input: bool = True, headless: bool = False) -> str:
+    """Keep the controlled browser open until the person closes its tab."""
+    store.update_job(
+        job_id,
+        state='needs_input' if needs_input else 'awaiting_review',
+        input_request=message,
+    )
+    if progress:
+        progress(f'Input needed: {message}')
+    else:
+        store.event(job_id, f'Input needed: {message}')
+    if not headless:
+        try:
+            if not page.is_closed():
+                page.wait_for_event('close', timeout=0)
+        except Exception:
+            pass
+    return message
+
+
+def _unresolved_required_fields(page, container) -> list[str]:
+    """Read only visible, browser-invalid controls after the safe autofill pass."""
+    unresolved = []
+    controls = container.locator('input:invalid:visible, select:invalid:visible, textarea:invalid:visible')
+    for index in range(_safe_count(controls)):
+        control = controls.nth(index)
+        try:
+            unresolved.append(_extract_element_label(control, page) or 'an employer-required field')
+        except Exception:
+            unresolved.append('an employer-required field')
+    return list(dict.fromkeys(unresolved))
+
 def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = False, progress=None) -> str:
     """AI Auto-Apply agent using persistent user-logged-in browser session."""
     from . import form_engine
@@ -237,7 +272,7 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
     if progress:
         progress('Launching browser session with your saved logins…')
 
-    store.update_job(job_id, state='submitting')
+    store.update_job(job_id, state='submitting', input_request=None)
     store.event(job_id, 'AI Auto-Apply started. Connecting to job portal…')
 
     clicked = False
@@ -321,7 +356,7 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
                             ext_apply.click()
                         page = popup_info.value
                         page.wait_for_timeout(3000)
-                        return _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_submit, progress)
+                        return _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_submit, progress, headless=headless)
                     else:
                         # Capture diagnostics on failure (AA-01)
                         diag_folder = store.DATA / 'diagnostics'
@@ -337,16 +372,29 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
                 if progress:
                     progress('Opening LinkedIn Easy Apply modal…')
                 apply_btn.click()
-                page.wait_for_timeout(2000)
+                modal = page.locator(EASY_APPLY_MODAL_SELECTOR).first
+                try:
+                    modal.wait_for(state='visible', timeout=12000)
+                except Exception:
+                    return _handoff_to_user(
+                        page, job_id,
+                        'Easy Apply opened, but the form was not detected. Check this browser tab and continue manually.',
+                        progress, headless=headless,
+                    )
 
                 # 3. Handle Easy Apply modal traversal
                 max_steps = 12
                 step = 0
+                cv_attached = False
                 while step < max_steps:
                     step += 1
-                    modal = page.locator('div[role="dialog"], .jobs-easy-apply-modal').first
+                    modal = page.locator(EASY_APPLY_MODAL_SELECTOR).first
                     if not _safe_count(modal) or not modal.is_visible():
-                        break
+                        return _handoff_to_user(
+                            page, job_id,
+                            'The Easy Apply form is no longer visible. Check the posting in this browser tab.',
+                            progress, headless=headless,
+                        )
 
                     if blocked(page):
                         store.update_job(job_id, state='needs_input')
@@ -355,19 +403,36 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
                     if progress:
                         progress(f'Answering questions on application step {step}…')
 
-                    # Attach tailored CV if file input is present on this step
-                    file_input = modal.locator('input[type="file"]').first
-                    if _safe_count(file_input):
-                        try:
-                            if progress:
-                                progress('Attaching tailored CV PDF…')
-                            file_input.set_input_files(str(pdf_path))
-                            page.wait_for_timeout(1000)
-                        except Exception:
-                            pass
+                    # Attach only to an unambiguous CV field; keep unknown uploads for review.
+                    file_inputs = modal.locator('input[type="file"]')
+                    upload_issue = None
+                    if _safe_count(file_inputs) == 1:
+                        file_input = file_inputs.first
+                        upload_label = _extract_element_label(file_input, page).casefold()
+                        if upload_label and not re.search(r'resume|cv\b|curriculum vitae', upload_label):
+                            upload_issue = 'Choose the correct CV upload field'
+                        else:
+                            try:
+                                if progress:
+                                    progress('Attaching tailored CV PDF…')
+                                file_input.set_input_files(str(pdf_path))
+                                cv_attached = True
+                                page.wait_for_timeout(1000)
+                            except Exception:
+                                upload_issue = 'Attach the tailored CV PDF'
+                    elif _safe_count(file_inputs) > 1:
+                        upload_issue = 'Choose the correct CV upload field'
 
-                    # Read and fill form controls on this modal step
-                    _fill_container_fields(page, modal, profile, job, package, prefs)
+                    unresolved = _fill_container_fields(page, modal, profile, job, package, prefs) or []
+                    unresolved.extend(_unresolved_required_fields(page, modal))
+                    if upload_issue:
+                        unresolved.append(upload_issue)
+                    if unresolved:
+                        names = ', '.join(dict.fromkeys(unresolved))[:350]
+                        return _handoff_to_user(
+                            page, job_id, f'Complete these employer fields: {names}. The browser will stay open.',
+                            progress, headless=headless,
+                        )
 
                     # Check navigation buttons
                     submit_btn = modal.locator('button:has-text("Submit application"), button[aria-label="Submit application"]').first
@@ -431,17 +496,15 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
                             store.event(job_id, 'AI Auto-Apply successfully submitted the application on LinkedIn.')
                             return 'Application submitted successfully to LinkedIn with confirmation screenshot saved.'
                         else:
-                            if progress:
-                                progress('Form completed and CV attached! Paused at final Review step.')
-                            store.event(job_id, 'AI Auto-Apply pre-filled all questions and attached your CV. Ready for your final review in the browser.')
-                            store.update_job(job_id, state='awaiting_review')
-                            # Durable Co-Pilot review handoff (AA-09)
-                            if not headless:
-                                try:
-                                    page.wait_for_event('close', timeout=0)
-                                except Exception:
-                                    pass
-                            return 'All questions answered and tailored CV attached. Review and submit in your browser window.'
+                            review_message = (
+                                'Review the completed employer form and submit it yourself. The browser will stay open.'
+                                if cv_attached else
+                                'Review the employer form and select the correct CV before submitting. The browser will stay open.'
+                            )
+                            return _handoff_to_user(
+                                page, job_id, review_message, progress,
+                                needs_input=not cv_attached, headless=headless,
+                            )
 
                     elif has_review:
                         review_btn.click()
@@ -450,12 +513,19 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
                         next_btn.click()
                         page.wait_for_timeout(1500)
                     else:
-                        break
+                        return _handoff_to_user(
+                            page, job_id,
+                            'The agent cannot find the next application step. Continue in this browser tab.',
+                            progress, headless=headless,
+                        )
 
-                store.update_job(job_id, state='awaiting_review')
-                return 'Application form processed. Complete any remaining questions and submit.'
+                return _handoff_to_user(
+                    page, job_id,
+                    'The application has more steps than the agent can verify. Continue in this browser tab.',
+                    progress, headless=headless,
+                )
             else:
-                return _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_submit, progress)
+                return _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_submit, progress, headless=headless)
 
         except Exception:
             store.update_job(job_id, state='uncertain' if clicked else 'needs_input')
@@ -467,17 +537,19 @@ def _fill_container_fields(page, container, profile, job, package, prefs):
     if 'answers' not in package or not isinstance(package.get('answers'), dict):
         package['answers'] = {}
     answers = package['answers']
+    unresolved = []
 
     # 1. Text, number, email, tel, textarea inputs
     inputs = container.locator('input[type="text"]:visible, input[type="email"]:visible, input[type="tel"]:visible, input[type="number"]:visible, input:not([type]):visible, textarea:visible')
     for i in range(_safe_count(inputs)):
         el = inputs.nth(i)
+        label = 'an employer-required field'
+        required = False
         try:
+            label = _extract_element_label(el, page) or label
+            required = el.get_attribute('required') is not None or el.get_attribute('aria-required') == 'true' or '*' in label
             curr = el.input_value()
             if curr and len(curr) > 1:
-                continue
-            label = _extract_element_label(el, page)
-            if not label:
                 continue
             field_dict = {'label': label, 'type': el.get_attribute('type') or 'text', 'options': []}
             ans = form_engine.answer_single_field(field_dict, profile, job, package, prefs)
@@ -485,15 +557,23 @@ def _fill_container_fields(page, container, profile, job, package, prefs):
                 el.fill(str(ans))
                 answers[label] = str(ans)
                 page.wait_for_timeout(200)
+            elif required:
+                unresolved.append(label)
         except Exception:
-            continue
+            if required:
+                unresolved.append(label)
 
     # 2. Select dropdowns
     selects = container.locator('select:visible')
     for i in range(_safe_count(selects)):
         el = selects.nth(i)
+        label = 'an employer-required selection'
+        required = False
         try:
-            label = _extract_element_label(el, page)
+            label = _extract_element_label(el, page) or label
+            required = el.get_attribute('required') is not None or el.get_attribute('aria-required') == 'true' or '*' in label
+            if el.input_value():
+                continue
             opts = el.locator('option')
             opt_list = []
             for o in range(_safe_count(opts)):
@@ -508,15 +588,23 @@ def _fill_container_fields(page, container, profile, job, package, prefs):
                     el.select_option(label=str(ans))
                 answers[label] = str(ans)
                 page.wait_for_timeout(200)
+            elif required:
+                unresolved.append(label)
         except Exception:
-            continue
+            if required:
+                unresolved.append(label)
 
     # 3. Radio groups
     radios = container.locator('input[type="radio"]:visible, div[role="radio"]:visible')
     for i in range(_safe_count(radios)):
         el = radios.nth(i)
+        label = 'an employer-required choice'
+        required = False
         try:
-            label = _extract_element_label(el, page)
+            label = _extract_element_label(el, page) or label
+            required = el.get_attribute('required') is not None or el.get_attribute('aria-required') == 'true'
+            if el.is_checked():
+                continue
             field_dict = {'label': label, 'type': 'radio', 'options': []}
             ans = form_engine.answer_single_field(field_dict, profile, job, package, prefs)
             if ans and ans.casefold() in ('yes', 'true', '1'):
@@ -524,16 +612,20 @@ def _fill_container_fields(page, container, profile, job, package, prefs):
                     el.check()
                     answers[label] = 'true'
                     page.wait_for_timeout(200)
+            elif required:
+                unresolved.append(label)
         except Exception:
-            continue
+            if required:
+                unresolved.append(label)
 
     try:
         if package.get('id'):
             store.revise_package(package['id'], store.package_data(package))
     except Exception:
         pass
+    return list(dict.fromkeys(unresolved))
 
-def _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_submit, progress):
+def _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_submit, progress, *, headless=False):
     """Handle generic hosted ATS portals (Greenhouse, Lever, Workable, etc.)."""
     job_id = job['id']
     if progress:
@@ -542,21 +634,38 @@ def _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_subm
 
     # Attach CV to any file upload element
     cv_attached = False
+    upload_issue = None
     try:
         file_inputs = page.locator('input[type="file"]')
-        if _safe_count(file_inputs) > 0:
-            if progress:
-                progress('Attaching tailored CV PDF…')
-            file_inputs.first.set_input_files(str(pdf_path))
-            page.wait_for_timeout(1000)
-            cv_attached = True
+        if _safe_count(file_inputs) == 1:
+            file_input = file_inputs.first
+            upload_label = _extract_element_label(file_input, page).casefold()
+            if upload_label and not re.search(r'resume|cv\b|curriculum vitae', upload_label):
+                upload_issue = 'Choose the correct CV upload field'
+            else:
+                if progress:
+                    progress('Attaching tailored CV PDF…')
+                file_input.set_input_files(str(pdf_path))
+                page.wait_for_timeout(1000)
+                cv_attached = True
+        elif _safe_count(file_inputs) > 1:
+            upload_issue = 'Choose the correct CV upload field'
     except Exception:
-        pass
+        upload_issue = 'Attach the tailored CV PDF'
 
     # Fill all visible fields on the page
     if progress:
         progress('Auto-filling candidate details, screening questions, and salary…')
-    _fill_container_fields(page, page, profile, job, package, prefs)
+    unresolved = _fill_container_fields(page, page, profile, job, package, prefs) or []
+    unresolved.extend(_unresolved_required_fields(page, page))
+    if upload_issue:
+        unresolved.append(upload_issue)
+    if unresolved:
+        names = ', '.join(dict.fromkeys(unresolved))[:350]
+        return _handoff_to_user(
+            page, job_id, f'Complete these employer fields: {names}. The browser will stay open.',
+            progress, headless=headless,
+        )
 
     submit_btn = page.locator('button:has-text("Submit application"), button:has-text("Apply now"), button:has-text("Submit"), input[type="submit"]').first
     has_submit = False
@@ -621,13 +730,15 @@ def _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_subm
                     store.update_job(job_id, state='uncertain')
                 raise
         else:
-            if progress:
-                progress('All questions answered. Ready for final review!')
-            store.update_job(job_id, state='awaiting_review')
-            upload_msg = ' and CV uploaded' if cv_attached else ''
-            store.event(job_id, f'AI Auto-Apply pre-filled the application{upload_msg}. Ready for your review in the browser.')
-            return f'Application pre-filled{upload_msg}. Review and submit in your browser.'
+            message = (
+                'Review the filled application and submit it yourself. The browser will stay open.'
+                if cv_attached else
+                'Review the application and attach the tailored CV before submitting. The browser will stay open.'
+            )
+            return _handoff_to_user(page, job_id, message, progress, needs_input=not cv_attached, headless=headless)
 
-    store.update_job(job_id, state='awaiting_review')
-    upload_msg = ' and CV uploaded' if cv_attached else ''
-    return f'Application pre-filled{upload_msg}. Complete any remaining custom questions and submit.'
+    return _handoff_to_user(
+        page, job_id,
+        'No supported final application control was found. Continue manually in this browser tab.',
+        progress, headless=headless,
+    )

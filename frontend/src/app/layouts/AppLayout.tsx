@@ -1,4 +1,4 @@
-import { useState, useEffect, Fragment } from 'react'
+import { useState, useEffect, useRef, Fragment } from 'react'
 import { Outlet, NavLink, useLocation, Link } from 'react-router-dom'
 import {
   BriefcaseBusiness,
@@ -20,6 +20,7 @@ export function AppLayout() {
   const [dismissedRun, setDismissedRun] = useState<string>('')
   const [toast, setToast] = useState<string>('')
   const [isManualRefreshing, setIsManualRefreshing] = useState(false)
+  const notifiedInput = useRef('')
 
   const handleManualRefresh = async () => {
     setIsManualRefreshing(true)
@@ -38,6 +39,28 @@ export function AppLayout() {
   }, [toast])
 
   const activeRuns = data?.runs.filter((r) => ['queued', 'running'].includes(r.state)) || []
+  const waitingForInput = activeRuns[0]?.kind === 'auto_apply' && activeRuns[0]?.message?.startsWith('Input needed:')
+  const inputNeededJob = data?.jobs.find((job) =>
+    job.input_request && !['submitted', 'skipped'].includes(job.state)
+  )
+
+  useEffect(() => {
+    if (!inputNeededJob?.input_request) return
+    const previousTitle = document.title
+    document.title = 'Action needed · Jobfolio'
+    const notificationId = `${inputNeededJob.id}:${inputNeededJob.input_request}`
+    if (notifiedInput.current !== notificationId) {
+      notifiedInput.current = notificationId
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        try {
+          new Notification('Jobfolio needs your input', {
+            body: 'Open Jobfolio to review the employer application.',
+          })
+        } catch { /* The in-app alert remains available when OS notifications fail. */ }
+      }
+    }
+    return () => { document.title = previousTitle }
+  }, [inputNeededJob?.id, inputNeededJob?.input_request])
 
   // Derive initials from profile name
   const profileName = data?.profile?.name || 'Walid Hamdy'
@@ -172,6 +195,16 @@ export function AppLayout() {
             </div>
           )}
 
+          {inputNeededJob?.input_request && (
+            <div className="global-error" role="alert">
+              <Notice kind="warning">
+                <strong>Input needed for {inputNeededJob.title}</strong>
+                <p>{inputNeededJob.input_request}</p>
+                <Link to={`/jobs/${inputNeededJob.id}/application`}>Open application details</Link>
+              </Notice>
+            </div>
+          )}
+
           {/* Latest failed run alert */}
           {(() => {
             const failedRun = data?.runs?.[0]
@@ -229,12 +262,14 @@ export function AppLayout() {
             <div className="run-banner-card" role="status" aria-live="polite">
               <div className="run-banner-main">
                 <div className="run-spinner-wrap" aria-hidden="true">
-                  <LoaderCircle className="spin" size={20} />
+                  <LoaderCircle className={waitingForInput ? '' : 'spin'} size={20} />
                 </div>
                 <div className="run-banner-text">
                   <div className="run-banner-title">
                     <strong>
-                      {activeRuns[0].kind === 'prepare'
+                      {waitingForInput
+                        ? 'Waiting for your input'
+                        : activeRuns[0].kind === 'prepare'
                         ? 'Preparing tailored CV'
                         : activeRuns[0].kind === 'search'
                         ? 'Searching job opportunities'
@@ -244,17 +279,19 @@ export function AppLayout() {
                         ? 'Submitting approved application'
                         : activeRuns[0].kind === 'cover-letter'
                         ? 'Drafting tailored cover letter'
+                        : activeRuns[0].kind === 'auto_apply'
+                        ? 'Filling employer application'
                         : 'Importing job posting'}
-                      …
+                      {!waitingForInput && '…'}
                     </strong>
                     <span className="live-pill">
                       <span className="pulse-dot" aria-hidden="true" />
-                      Live Agent Processing
+                      {waitingForInput ? 'Paused for your answer' : 'Live Agent Processing'}
                     </span>
                   </div>
                   <p className="run-step-text">{activeRuns[0].message || 'Agent active…'}</p>
                 </div>
-                <span className="run-banner-aside">Background operation</span>
+                <span className="run-banner-aside">{waitingForInput ? 'Input required' : 'Background operation'}</span>
               </div>
             </div>
           )}
