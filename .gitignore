@@ -3,11 +3,11 @@ node_modules/
 frontend/dist/
 *.tsbuildinfo
 data/
-.env
 __pycache__/
 .pytest_cache/
 *.pyc
 tmp/
+.env
+.impeccable/config.local.json
 *.pdf
 *.docx
-.impeccable/config.local.json
