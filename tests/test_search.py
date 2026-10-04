@@ -21,6 +21,24 @@ def test_all_providers_obey_location_date_and_title_criteria():
     assert search._matches_search_filters({**item, 'location': 'Worldwide'}, {**prefs, 'remote_only': True}, titles, now)
 
 
+def test_serper_scope_can_verify_region_and_freshness_without_inventing_metadata():
+    now = datetime.now(timezone.utc)
+    prefs = {'location': 'Cairo', 'country': 'Egypt', 'date_posted': 'past_week'}
+    item = {
+        'job_title': 'Frontend Software Engineer',
+        'location': 'Location not stated (search region: Cairo, Egypt)',
+        'location_scope_only': True,
+        'search_region': 'Cairo, Egypt',
+        'date_scope_applied': True,
+        'posted_at': None,
+    }
+
+    assert search._matches_search_filters(item, prefs, ['Frontend Software Engineer'], now)
+    assert not search._matches_search_filters(
+        {**item, 'date_scope_applied': False}, prefs, ['Frontend Software Engineer'], now
+    )
+
+
 def test_publisher_posting_dates_are_normalized():
     assert search._posting_date('Thu, 24 Sep 2026 10:00:00 +0000') == '2026-09-24T10:00:00+00:00'
     assert search._posting_date('2026-09-24T10:00:00+00:00') == '2026-09-24T10:00:00+00:00'
@@ -70,7 +88,7 @@ def test_free_search_with_mocked_feeds(client, monkeypatch):
         url_str = str(url)
         if 'remotive.com' in url_str:
             return MockResponse({'jobs': [
-                {'url': 'https://remotive.com/job/1', 'title': 'Frontend Engineer', 'company_name': 'GoodCorp', 'candidate_required_location': 'Worldwide', 'description': 'React remote job'},
+                {'url': 'https://remotive.com/job/1', 'title': 'Frontend Engineer', 'company_name': 'GoodCorp', 'company_logo': 'https://remotive.com/logo/goodcorp.png', 'candidate_required_location': 'Worldwide', 'description': 'React remote job'},
                 {'url': 'https://remotive.com/job/2', 'title': 'Frontend Intern', 'company_name': 'GoodCorp', 'candidate_required_location': 'Worldwide', 'description': 'internship'},
                 {'url': 'https://remotive.com/job/3', 'title': 'Frontend Engineer', 'company_name': 'BadCorp', 'candidate_required_location': 'Worldwide', 'description': 'React remote job'}
             ]})
@@ -97,6 +115,8 @@ def test_free_search_with_mocked_feeds(client, monkeypatch):
     urls = [r['url'] for r in results]
     assert 'https://remotive.com/job/1' in urls
     assert 'https://jobicy.com/job/4' in urls
+    remotive = next(r for r in results if r['url'] == 'https://remotive.com/job/1')
+    assert remotive['company_logo_url'] == 'https://remotive.com/logo/goodcorp.png'
 
 def test_search_provider_brave_requires_key(client, monkeypatch):
     prefs = store.setting('preferences', {})
@@ -310,6 +330,7 @@ def test_linkedin_guest_search_and_import(monkeypatch):
         <a class="base-card__full-link" href="https://eg.linkedin.com/jobs/view/senior-react-dev-12345678"></a>
         <h3 class="base-search-card__title">Senior React Developer</h3>
         <h4 class="base-search-card__subtitle">Acme Egypt</h4>
+        <div class="search-entity-media"><img src="https://media.licdn.com/dms/image/company-logo.png"></div>
         <span class="job-search-card__location">Cairo, Egypt</span>
       </li>
     </ul>
@@ -347,6 +368,7 @@ def test_linkedin_guest_search_and_import(monkeypatch):
         assert len(results) == 1
         assert results[0]['job_title'] == 'Senior React Developer'
         assert results[0]['company'] == 'Acme Egypt'
+        assert results[0]['company_logo_url'] == 'https://media.licdn.com/dms/image/company-logo.png'
         assert results[0]['location'] == 'Cairo, Egypt'
         assert results[0]['platform'] == 'linkedin'
         assert results[0]['source'] == 'LinkedIn Jobs'
@@ -359,17 +381,15 @@ def test_linkedin_guest_search_and_import(monkeypatch):
     assert imported['platform'] == 'linkedin'
     assert 'TypeScript and Next.js' in imported['description']
 
-def test_serper_google_jobs_search(monkeypatch):
-    """Test Serper Google Jobs API parsing."""
+def test_serper_search_api_parsing(monkeypatch):
+    """Parse Serper's web search results without implying structured job details."""
     sample_serper_response = {
-        'jobs': [
+        'organic': [
             {
-                'title': 'Staff Frontend Engineer',
-                'companyName': 'GlobalTech',
-                'location': 'Cairo, Egypt',
-                'description': 'Building next-gen web platforms in React and TypeScript.',
-                'via': 'via LinkedIn',
-                'link': 'https://example.com/apply/1'
+                'title': 'Staff Frontend Engineer Jobs in Cairo, Egypt | GlobalTech',
+                'snippet': 'Building next-gen web platforms in React and TypeScript.',
+                'date': '2 days ago',
+                'link': 'https://example.com/careers/1'
             }
         ]
     }
@@ -381,18 +401,74 @@ def test_serper_google_jobs_search(monkeypatch):
         def json(self):
             return self._json
 
+    captured = []
+
     def mock_post(self, url, *args, **kwargs):
+        captured.append({'url': url, **kwargs})
         return MockResponse(sample_serper_response)
 
     monkeypatch.setattr(httpx.Client, 'post', mock_post)
 
-    results = search._search_serper_google_jobs('mock-serper-key', ['Staff Frontend Engineer'], {'location': 'Cairo, Egypt'})
+    results = search._search_serper_job_search(
+        'mock-serper-key',
+        ['Staff Frontend Engineer'],
+        {'location': 'Cairo', 'country': 'Egypt', 'date_posted': 'past_week'},
+    )
     assert len(results) == 1
-    assert results[0]['title'] == 'Staff Frontend Engineer at GlobalTech'
-    assert results[0]['company'] == 'GlobalTech'
-    assert results[0]['platform'] == 'google'
-    assert 'Google Jobs (via LinkedIn)' in results[0]['source']
+    assert len(captured) == 2
+    assert all(request['url'] == 'https://google.serper.dev/search' for request in captured)
+    assert captured[0]['json']['gl'] == 'eg'
+    assert captured[0]['json']['tbs'] == 'qdr:w'
+    assert 'site:wuzzuf.net' in captured[1]['json']['q']
+    assert 'site:indeed.com' in captured[1]['json']['q']
+    assert 'site:bayt.com' in captured[1]['json']['q']
+    assert results[0]['title'] == 'Staff Frontend Engineer Jobs in Cairo, Egypt | GlobalTech'
+    assert results[0]['company'] == 'Not stated in search result'
+    assert results[0]['location_scope_only'] is True
+    assert 'Location not stated' in results[0]['location']
+    assert results[0]['source'] == 'Google Search via Serper'
+    assert results[0]['posted_at']
     assert 'React and TypeScript' in results[0]['description']
+
+
+def test_serper_regional_results_are_labeled_from_their_host():
+    assert search._serper_source_label('https://www.wuzzuf.net/jobs/p/123') == 'Wuzzuf via Serper'
+    assert search._serper_source_label('https://eg.indeed.com/viewjob?jk=123') == 'Indeed via Serper'
+    assert search._serper_source_label('https://www.example.com/jobs/123') == 'Google Search via Serper'
+
+def test_serper_unauthorized_response_is_reported(client, monkeypatch):
+    class UnauthorizedResponse:
+        status_code = 403
+
+    monkeypatch.setattr(httpx.Client, 'post', lambda *args, **kwargs: UnauthorizedResponse())
+    monkeypatch.setattr(providers, 'secret', lambda name: 'mock-serper-key')
+    store.set_setting('search_provider', 'serper')
+    store.set_setting('preferences', {
+        'titles': ['Frontend Engineer'], 'location': 'Cairo', 'country': 'Egypt',
+        'date_posted': 'any', 'experience_level': 'any', 'job_type': 'any',
+        'remote_only': False, 'workplace_type': 'any', 'excluded_companies': [],
+        'excluded_keywords': [], 'confirmed': True,
+    })
+
+    with pytest.raises(ValueError, match='HTTP 403.*Serper.dev'):
+        search.search_jobs()
+
+def test_serper_http_errors_are_reported_instead_of_becoming_empty_success(client, monkeypatch):
+    class UnauthorizedResponse:
+        status_code = 403
+
+    monkeypatch.setattr(httpx.Client, 'post', lambda *args, **kwargs: UnauthorizedResponse())
+    monkeypatch.setattr(providers, 'secret', lambda name: 'mock-serper-key')
+    store.set_setting('search_provider', 'serper')
+    store.set_setting('preferences', {
+        'titles': ['Frontend Engineer'], 'location': 'Cairo', 'country': 'Egypt',
+        'date_posted': 'any', 'experience_level': 'any', 'job_type': 'any',
+        'remote_only': False, 'workplace_type': 'any', 'excluded_companies': [],
+        'excluded_keywords': [], 'confirmed': True,
+    })
+
+    with pytest.raises(ValueError, match='HTTP 403.*Serper.dev'):
+        search.search_jobs()
 
 def test_settings_serper_provider(client, monkeypatch):
     """Test configuring serper provider in Settings."""

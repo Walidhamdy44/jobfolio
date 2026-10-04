@@ -5,6 +5,7 @@ import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 import httpx
 from . import store, providers, network
@@ -43,10 +44,28 @@ def _posting_date(value: object) -> str | None:
         if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
             posted = datetime.fromtimestamp(int(value), timezone.utc)
         elif isinstance(value, str):
-            try:
-                posted = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
-            except ValueError:
-                posted = parsedate_to_datetime(value)
+            relative = value.strip().casefold()
+            relative_match = re.fullmatch(r'(?:about\s+)?(\d+)\s+(minute|hour|day|week|month)s?\s+ago', relative)
+            if relative in {'today', 'just posted'}:
+                posted = datetime.now(timezone.utc)
+            elif relative in {'yesterday', 'a day ago', '1 day ago'}:
+                posted = datetime.now(timezone.utc) - timedelta(days=1)
+            elif relative_match:
+                amount = int(relative_match.group(1))
+                unit = relative_match.group(2)
+                duration = {
+                    'minute': timedelta(minutes=amount),
+                    'hour': timedelta(hours=amount),
+                    'day': timedelta(days=amount),
+                    'week': timedelta(weeks=amount),
+                    'month': timedelta(days=amount * 30),
+                }[unit]
+                posted = datetime.now(timezone.utc) - duration
+            else:
+                try:
+                    posted = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+                except ValueError:
+                    posted = parsedate_to_datetime(value)
         else:
             return None
         if posted.tzinfo is None:
@@ -84,7 +103,15 @@ def _matches_search_filters(item: dict, prefs: dict, targets: list[str], now: da
     location = ' '.join((item.get('location') or '').casefold().split())
     remote_search = prefs.get('remote_only') or prefs.get('workplace_type') == 'remote'
     worldwide = location in {'remote', 'worldwide', 'anywhere', 'anywhere in the world', 'global'}
-    if not (remote_search and worldwide):
+    if item.get('location_scope_only'):
+        # Organic web results don't have a structured job location. Keep results
+        # scoped by the Serper query, but label the location as unverified in UI.
+        region = (item.get('search_region') or '').casefold()
+        if city and city not in region:
+            return False
+        if country and country not in region:
+            return False
+    elif not (remote_search and worldwide):
         if city and city not in location:
             return False
         if country and country not in location:
@@ -94,13 +121,17 @@ def _matches_search_filters(item: dict, prefs: dict, targets: list[str], now: da
     if max_age:
         posted_at = item.get('posted_at')
         if not posted_at:
-            return False
-        try:
-            posted = datetime.fromisoformat(posted_at)
-        except (ValueError, TypeError):
-            return False
-        if not now - max_age <= posted <= now:
-            return False
+            # Serper's tbs query restricts freshness even when Google omits a
+            # human-readable date from an organic result. Keep the date unknown.
+            if not item.get('date_scope_applied'):
+                return False
+        else:
+            try:
+                posted = datetime.fromisoformat(posted_at)
+            except (ValueError, TypeError):
+                return False
+            if not now - max_age <= posted <= now:
+                return False
     return True
 
 def clean_html_text(html_or_text: str) -> str:
@@ -120,6 +151,19 @@ def clean_html_text(html_or_text: str) -> str:
 
 def _extract_text_content(html_or_text: str) -> str:
     return clean_html_text(html_or_text)
+
+
+def _logo_url(*values: object) -> str | None:
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        candidate = value.strip()
+        if candidate.startswith('//'):
+            candidate = 'https:' + candidate
+        parsed = urlparse(candidate)
+        if parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password:
+            return candidate
+    return None
 
 def _search_weworkremotely(client: httpx.Client, titles: list[str], prefs: dict, issues: list[str] | None = None) -> list[dict]:
     results = []
@@ -178,6 +222,7 @@ def _search_remotive(client: httpx.Client, query: str, prefs: dict, issues: list
                     continue
                 title = clean_html_text(item.get('title', ''))
                 company = clean_html_text(item.get('company_name', ''))
+                company_logo = _logo_url(item.get('company_logo'), item.get('company_logo_url'), item.get('logo'))
                 location = clean_html_text(item.get('candidate_required_location', 'Worldwide'))
                 posted_at = _posting_date(item.get('publication_date'))
                 desc = clean_html_text(item.get('description', ''))
@@ -187,6 +232,7 @@ def _search_remotive(client: httpx.Client, query: str, prefs: dict, issues: list
                     'title': f"{title} at {company}",
                     'job_title': title,
                     'company': company,
+                    'company_logo_url': company_logo,
                     'location': location,
                     'posted_at': posted_at,
                     'description': desc,
@@ -223,6 +269,7 @@ def _search_jobicy(client: httpx.Client, query: str, prefs: dict, issues: list[s
                     continue
                 title = clean_html_text(item.get('jobTitle', ''))
                 company = clean_html_text(item.get('companyName', ''))
+                company_logo = _logo_url(item.get('companyLogo'), item.get('companyLogoUrl'), item.get('company_logo'))
                 location = clean_html_text(item.get('jobGeo', 'Remote'))
                 posted_at = _posting_date(item.get('pubDate'))
                 desc = clean_html_text(item.get('jobDescription', ''))
@@ -232,6 +279,7 @@ def _search_jobicy(client: httpx.Client, query: str, prefs: dict, issues: list[s
                     'title': f"{title} at {company}",
                     'job_title': title,
                     'company': company,
+                    'company_logo_url': company_logo,
                     'location': location,
                     'posted_at': posted_at,
                     'description': desc,
@@ -259,6 +307,7 @@ def _search_arbeitnow(client: httpx.Client, query: str, prefs: dict, issues: lis
                     continue
                 title = clean_html_text(item.get('title', ''))
                 company = clean_html_text(item.get('company_name', ''))
+                company_logo = _logo_url(item.get('company_logo'), item.get('company_logo_url'))
                 location = clean_html_text(item.get('location', ''))
                 posted_at = _posting_date(item.get('created_at'))
                 tags = ' '.join(item.get('tags', []))
@@ -272,6 +321,7 @@ def _search_arbeitnow(client: httpx.Client, query: str, prefs: dict, issues: lis
                     'title': f"{title} at {company}",
                     'job_title': title,
                     'company': company,
+                    'company_logo_url': company_logo,
                     'location': location or 'Remote',
                     'posted_at': posted_at,
                     'description': desc,
@@ -384,6 +434,12 @@ def _search_linkedin(client: httpx.Client, titles: list[str], prefs: dict, issue
                     job_title = clean_html_text(title_el.get_text(strip=True)) if title_el else title
                     company_el = c.select_one('.base-search-card__subtitle')
                     company = clean_html_text(company_el.get_text(strip=True)) if company_el else 'Employer'
+                    logo_el = c.select_one('.search-entity-media img') or c.select_one('img')
+                    company_logo = _logo_url(
+                        logo_el.get('src') if logo_el else None,
+                        logo_el.get('data-delayed-url') if logo_el else None,
+                        logo_el.get('data-ghost-url') if logo_el else None,
+                    )
                     loc_el = c.select_one('.job-search-card__location')
                     job_loc = clean_html_text(loc_el.get_text(strip=True)) if loc_el else loc
                     time_el = c.select_one('time[datetime]')
@@ -395,6 +451,7 @@ def _search_linkedin(client: httpx.Client, titles: list[str], prefs: dict, issue
                         'title': f"{job_title} at {company}",
                         'job_title': job_title,
                         'company': company,
+                        'company_logo_url': company_logo,
                         'location': job_loc,
                         'posted_at': posted_at,
                         'description': '',
@@ -408,7 +465,106 @@ def _search_linkedin(client: httpx.Client, titles: list[str], prefs: dict, issue
                 continue
     return results
 
-def _search_serper_google_jobs(api_key: str, titles: list[str], prefs: dict) -> list[dict]:
+_SERPER_COUNTRY_CODES = {
+    'australia': 'au', 'canada': 'ca', 'egypt': 'eg', 'france': 'fr',
+    'germany': 'de', 'india': 'in', 'ireland': 'ie', 'italy': 'it',
+    'japan': 'jp', 'netherlands': 'nl', 'new zealand': 'nz', 'saudi arabia': 'sa',
+    'singapore': 'sg', 'south africa': 'za', 'spain': 'es', 'united arab emirates': 'ae',
+    'united kingdom': 'gb', 'uk': 'gb', 'united states': 'us', 'usa': 'us',
+}
+
+
+def _serper_country_code(country: str) -> str | None:
+    normalized = country.strip().casefold()
+    if re.fullmatch(r'[a-z]{2}', normalized):
+        return normalized
+    return _SERPER_COUNTRY_CODES.get(normalized)
+
+
+_SERPER_REGIONAL_SITES = {
+    'wuzzuf.net': 'Wuzzuf',
+    'indeed.com': 'Indeed',
+    'forasna.com': 'Forasna',
+    'bayt.com': 'Bayt',
+    'tanqeeb.com': 'Tanqeeb',
+    'naukrigulf.com': 'Naukri Gulf',
+    'gulftalent.com': 'GulfTalent',
+    'akhtaboot.com': 'Akhtaboot',
+}
+_SERPER_REGIONAL_SITE_QUERY = ' OR '.join(f'site:{domain}' for domain in _SERPER_REGIONAL_SITES)
+
+
+def _serper_source_label(url: str) -> str:
+    host = (urlparse(url).hostname or '').casefold().removeprefix('www.')
+    for domain, name in _SERPER_REGIONAL_SITES.items():
+        if host == domain or host.endswith('.' + domain):
+            return f'{name} via Serper'
+    return 'Google Search via Serper'
+
+
+def _add_serper_results(client, payload, headers, issues, results, seen_urls, location, date_posted):
+    try:
+        response = client.post('https://google.serper.dev/search', json=payload, headers=headers)
+        if response.status_code != 200:
+            if response.status_code == 401:
+                _feed_issue(issues, 'Serper Search', 'HTTP 401: the API key was rejected')
+                return False
+            if response.status_code == 403:
+                _feed_issue(issues, 'Serper Search', 'HTTP 403: access denied; verify this is a Serper.dev API key')
+                return False
+            if response.status_code == 402:
+                _feed_issue(issues, 'Serper Search', 'HTTP 402: the account has no available credits')
+                return False
+            if response.status_code == 429:
+                _feed_issue(issues, 'Serper Search', 'HTTP 429: rate limit exceeded')
+                return False
+            _feed_issue(issues, 'Serper Search', f'HTTP {response.status_code}')
+            return True
+
+        for hit in response.json().get('organic', []):
+            link = hit.get('link') or ''
+            if not link.startswith(('https://', 'http://')) or link in seen_urls:
+                continue
+            seen_urls.add(link)
+
+            job_title = clean_html_text(hit.get('title', ''))
+            description = clean_html_text(hit.get('snippet', ''))
+            results.append({
+                'url': link,
+                'title': job_title,
+                'job_title': job_title,
+                'company': 'Not stated in search result',
+                'location': f'Location not stated (search region: {location})' if location else 'Location not stated',
+                'location_scope_only': bool(location),
+                'search_region': location,
+                'date_scope_applied': date_posted in {'past_24h', 'past_week', 'past_month'},
+                'posted_at': _posting_date(hit.get('date')),
+                'description': description,
+                'snippet': description,
+                'platform': network.platform(link),
+                'source': _serper_source_label(link),
+                'raw_text': f'{job_title} {description}'.casefold(),
+            })
+    except httpx.TimeoutException:
+        _feed_issue(issues, 'Serper Search', 'request timed out')
+    except httpx.ConnectError as exc:
+        reason = 'TLS certificate verification failed' if 'CERTIFICATE_VERIFY_FAILED' in str(exc) else 'connection failed'
+        _feed_issue(issues, 'Serper Search', reason)
+    except httpx.HTTPError as exc:
+        _feed_issue(issues, 'Serper Search', type(exc).__name__)
+    except ValueError:
+        _feed_issue(issues, 'Serper Search', 'invalid JSON response')
+    except Exception as exc:
+        _feed_issue(issues, 'Serper Search', type(exc).__name__)
+    return True
+
+
+def _search_serper_job_search(
+    api_key: str,
+    titles: list[str],
+    prefs: dict,
+    issues: list[str] | None = None,
+) -> list[dict]:
     results = []
     city = prefs.get('location', '').strip()
     country = prefs.get('country', '').strip()
@@ -427,7 +583,8 @@ def _search_serper_google_jobs(api_key: str, titles: list[str], prefs: dict) -> 
     }
 
     seen_urls = set()
-    with httpx.Client(timeout=25, trust_env=False) as client:
+    country_code = _serper_country_code(country)
+    with httpx.Client(timeout=25, trust_env=False, verify=_search_ssl_context()) as client:
         for title in titles:
             query_parts = [title]
             if experience_level == 'senior':
@@ -453,11 +610,14 @@ def _search_serper_google_jobs(api_key: str, titles: list[str], prefs: dict) -> 
 
             if location:
                 query_parts.append(location)
+            query_parts.extend(['jobs', 'careers', 'hiring', 'apply'])
 
             payload = {
                 'q': ' '.join(query_parts),
-                'location': location if location else 'United States'
+                'num': 10,
             }
+            if country_code:
+                payload['gl'] = country_code
             if date_posted == 'past_24h':
                 payload['tbs'] = 'qdr:d'
             elif date_posted == 'past_week':
@@ -465,39 +625,13 @@ def _search_serper_google_jobs(api_key: str, titles: list[str], prefs: dict) -> 
             elif date_posted == 'past_month':
                 payload['tbs'] = 'qdr:m'
 
-            try:
-                r = client.post('https://google.serper.dev/jobs', json=payload, headers=headers)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                for job in data.get('jobs', []):
-                    link = job.get('link') or job.get('applyLink') or ''
-                    if not link or link in seen_urls:
-                        continue
-                    seen_urls.add(link)
+            if not _add_serper_results(client, payload, headers, issues, results, seen_urls, location, date_posted):
+                break
 
-                    job_title = clean_html_text(job.get('title', ''))
-                    company = clean_html_text(job.get('companyName', 'Employer'))
-                    job_loc = clean_html_text(job.get('location', location or 'Remote'))
-                    desc = clean_html_text(job.get('description', ''))
-                    via = clean_html_text(job.get('via', ''))
-
-                    snippet = f"{company} · {job_loc}{f' ({via})' if via else ''} · {desc[:220]}"
-                    results.append({
-                        'url': link,
-                        'title': f"{job_title} at {company}",
-                        'job_title': job_title,
-                        'company': company,
-                        'location': job_loc,
-                        'posted_at': _posting_date(job.get('date')),
-                        'description': desc,
-                        'snippet': snippet,
-                        'platform': 'google',
-                        'source': f"Google Jobs ({via})" if via else 'Google Jobs',
-                        'raw_text': f"{job_title} {company} {job_loc} {via} {desc}".casefold()
-                    })
-            except Exception:
-                continue
+            regional_payload = dict(payload)
+            regional_payload['q'] = f"{payload['q']} ({_SERPER_REGIONAL_SITE_QUERY})"
+            if not _add_serper_results(client, regional_payload, headers, issues, results, seen_urls, location, date_posted):
+                break
     return results
 
 def score_candidate(item: dict, target_titles: list[str], pref_location: str, remote_only: bool, prefs: dict | None = None) -> int:
@@ -581,10 +715,12 @@ def search_jobs(progress=None):
     if search_provider in ('serper', 'google'):
         key = providers.secret('SERPER_API_KEY')
         if not key:
-            raise ValueError('Connect a Serper Google Jobs API key in Settings, or switch to Free Search Feeds.')
+            raise ValueError('Connect a Serper.dev API key in Settings, or switch to Free Search Feeds.')
         if progress:
-            progress(f'Querying Google Jobs (via Serper) across {len(titles)} target roles…')
-        all_found = _search_serper_google_jobs(key, titles, prefs)
+            progress(f'Querying Google Search and regional job boards via Serper across {len(titles)} target roles…')
+        all_found = _search_serper_job_search(key, titles, prefs, feed_issues)
+        if progress:
+            progress(f'Serper returned {len(all_found)} web results before preference filters...')
         for item in all_found:
             can = network.canonical(item['url'])
             if can in seen:
@@ -698,6 +834,7 @@ def search_jobs(progress=None):
                     'title': item['title'],
                     'job_title': item.get('job_title', ''),
                     'company': item.get('company', ''),
+                    'company_logo_url': item.get('company_logo_url'),
                     'location': item.get('location', 'Remote'),
                     'posted_at': item.get('posted_at'),
                     'description': item.get('description', ''),
@@ -720,6 +857,8 @@ def search_jobs(progress=None):
 
     if not candidates and feed_issues:
         failures = ', '.join(dict.fromkeys(feed_issues))
+        if search_provider in ('serper', 'google'):
+            raise ValueError(f'Google Search via Serper failed: {failures}. Confirm the key is from Serper.dev, then retry.')
         raise ValueError(f'No jobs were returned because search sources failed: {failures}. Check the network or certificate configuration and retry.')
 
     if progress:
@@ -748,6 +887,7 @@ def search_jobs(progress=None):
             'title': c['title'],
             'job_title': c.get('job_title', ''),
             'company': c.get('company', ''),
+            'company_logo_url': c.get('company_logo_url'),
             'location': c.get('location', 'Remote'),
             'posted_at': c.get('posted_at'),
             'snippet': c['snippet'],
@@ -759,7 +899,7 @@ def search_jobs(progress=None):
     ]
     store.set_setting('search_results', {'at': store.now(), 'items': light_items})
     if search_provider in ('serper', 'google'):
-        source_name = 'Google Jobs (via Serper)'
+        source_name = 'Google Search via Serper'
     elif search_provider == 'brave':
         source_name = 'Brave Search'
     else:

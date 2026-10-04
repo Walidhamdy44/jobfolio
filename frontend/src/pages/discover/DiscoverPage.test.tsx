@@ -47,6 +47,15 @@ const mockBootstrap: Bootstrap = {
         platform: 'remotive',
         source: 'Remotive',
       },
+      {
+        url: 'https://eg.linkedin.com/jobs/view/12345678',
+        title: 'Senior Software Engineer at Acme',
+        snippet: 'Build reliable services with Acme in Cairo.',
+        platform: 'linkedin',
+        source: 'LinkedIn Jobs',
+        company: 'Acme Corp',
+        company_logo_url: 'https://media.licdn.com/dms/image/company-logo.png',
+      },
     ],
   },
   connections: {
@@ -86,6 +95,15 @@ describe('DiscoverPage (QA-06, QA-07, QA-08, QA-10)', () => {
     renderDiscoverPage('/discover')
     expect(screen.getByText('Jobicy')).toBeDefined()
     expect(screen.getByText('Remotive')).toBeDefined()
+  })
+
+  it('shows a distinct LinkedIn badge and the company logo when the feed provides one', () => {
+    renderDiscoverPage('/discover')
+    const linkedinBadge = screen.getByText('LinkedIn Jobs').closest('.platform-tag')
+    const companyMark = screen.getByRole('img', { name: 'Acme Corp company logo' })
+
+    expect(linkedinBadge?.className).toContain('platform-tag--linkedin')
+    expect(companyMark.querySelector('img')?.getAttribute('src')).toContain('/api/search/company-logo?url=')
   })
 
   it('filters results matching trimmed query (QA-07)', () => {

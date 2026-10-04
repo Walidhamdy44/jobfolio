@@ -2,6 +2,7 @@ import { Link, useOutletContext } from 'react-router-dom'
 import { FileText, Download, ArrowRight } from 'lucide-react'
 import { Empty } from '../../shared/ui/Empty'
 import type { Bootstrap } from '../../types'
+import './CvLibraryPage.css'
 
 export function CvLibraryPage() {
   const { data } = useOutletContext<{ data?: Bootstrap }>()
@@ -26,13 +27,13 @@ export function CvLibraryPage() {
           {jobsWithCv.map((j) => (
             <div className="library-row" key={j.id} role="listitem">
               <FileText size={27} aria-hidden="true" />
-              <div>
+              <div className="library-row-content">
                 <h2>{j.title}</h2>
                 <p>
                   {j.company} · {j.score}% coverage
                 </p>
               </div>
-              <div className="button-group">
+              <div className="button-group library-actions">
                 <a
                   className="button"
                   href={`/api/jobs/${j.id}/documents/pdf`}

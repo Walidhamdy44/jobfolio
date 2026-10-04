@@ -16,42 +16,7 @@ def normalized(text):
 
 def extract_requirements(description, ai):
     if ai:
-        rows = providers.ask(providers.Requirements,
-            'Extract ALL distinct substantive candidate requirements, including responsibilities, education, years, language and mandatory qualifications. Split compound criteria into atomic requirements, but retain conditions and negation. Do not extract company benefits. Required by default; preferred only if explicit. source_quote must be an exact excerpt from the description. No more than 60 requirements.',
-            {'description':description}).model_dump()['requirements']
-        desc_norm = normalized(description)
-        for r in rows:
-            quote = r.get('source_quote', '').strip()
-            if not quote:
-                raise ValueError('Requirement extraction returned empty quote. Please try again or use local preparation.')
-            q_norm = normalized(quote)
-            if q_norm not in desc_norm:
-                words = [w for w in q_norm.split() if len(w) > 2]
-                matched = any(' '.join(words[i:i+4]) in desc_norm for i in range(max(1, len(words)-3))) if len(words) >= 4 else False
-                if not matched:
-                    raise ValueError('Requirement extraction did not preserve source quotes. Please try again or use local preparation.')
-        # AI extraction can omit explicit checklist items. Supplement it with
-        # verbatim criteria from recognizable source sections so the review
-        # denominator never silently drops requirements that are in the posting.
-        try:
-            local_rows = extract_requirements(description, ai=False)
-        except ValueError:
-            local_rows = []
-        for local in local_rows:
-            local_tokens = tokens(local['text'])
-            represented = False
-            for ai_row in rows:
-                ai_tokens = tokens(ai_row['text'])
-                if not local_tokens or not ai_tokens:
-                    represented = normalized(local['text']) in normalized(ai_row['text']) or normalized(ai_row['text']) in normalized(local['text'])
-                else:
-                    represented = len(local_tokens & ai_tokens) / min(len(local_tokens), len(ai_tokens)) >= 0.82
-                if represented:
-                    if local['priority'] == 'required':
-                        ai_row['priority'] = 'required'
-                    break
-            if not represented:
-                rows.append(local)
+        rows = verify_ai_requirements(description, draft_ai_requirements(description))
     else:
         rows = []
         current_priority = None
@@ -87,8 +52,14 @@ def extract_requirements(description, ai):
 
             if current_priority is None or not 20 <= len(line) <= 450:
                 continue
-            rows.append({'text': line, 'priority': current_priority, 'source_quote': line})
+            priority = current_priority
+            if re.search(r'\b(?:preferred|nice to have|bonus|desirable|optional)\b', line, re.I):
+                priority = 'preferred'
+            rows.append({'text': line, 'priority': priority, 'source_quote': line})
         rows = rows[:60]
+    return deduplicate_requirements(rows)
+
+def deduplicate_requirements(rows):
     seen = {}
     result = []
     for r in rows:
@@ -102,12 +73,53 @@ def extract_requirements(description, ai):
         raise ValueError('No requirements could be identified. Add a complete description with requirements, or connect AI extraction.')
     return result
 
+def draft_ai_requirements(description):
+    return providers.ask(providers.Requirements,
+        'Extract ALL distinct substantive candidate requirements, including responsibilities, education, years, language and mandatory qualifications. Split compound criteria into atomic requirements, but retain conditions and negation. Do not extract company benefits. Required by default; preferred only if explicit. source_quote must be an exact excerpt from the description. No more than 60 requirements.',
+        {'description':description}).model_dump()['requirements']
+
+def verify_ai_requirements(description, rows):
+    rows = [dict(row) for row in rows]
+    desc_norm = normalized(description)
+    for r in rows:
+        quote = r.get('source_quote', '').strip()
+        if not quote:
+            raise ValueError('Requirement extraction returned empty quote. Please try again or use local preparation.')
+        q_norm = normalized(quote)
+        if q_norm not in desc_norm:
+            words = [w for w in q_norm.split() if len(w) > 2]
+            matched = any(' '.join(words[i:i+4]) in desc_norm for i in range(max(1, len(words)-3))) if len(words) >= 4 else False
+            if not matched:
+                raise ValueError('Requirement extraction did not preserve source quotes. Please try again or use local preparation.')
+    # AI extraction can omit explicit checklist items. Supplement it with
+    # verbatim criteria from recognizable source sections so the review
+    # denominator never silently drops requirements that are in the posting.
+    try:
+        local_rows = extract_requirements(description, ai=False)
+    except ValueError:
+        local_rows = []
+    for local in local_rows:
+        local_tokens = tokens(local['text'])
+        represented = False
+        for ai_row in rows:
+            ai_tokens = tokens(ai_row['text'])
+            if not local_tokens or not ai_tokens:
+                represented = normalized(local['text']) in normalized(ai_row['text']) or normalized(ai_row['text']) in normalized(local['text'])
+            else:
+                represented = len(local_tokens & ai_tokens) / min(len(local_tokens), len(ai_tokens)) >= 0.82
+            if represented:
+                if local['priority'] == 'required':
+                    ai_row['priority'] = 'required'
+                break
+        if not represented:
+            rows.append(local)
+    return rows
+
 def guard_rewrite(old, new):
     """Numeric changes are never silently introduced by prose editing."""
     return set(re.findall(r'\d+(?:[./]\d+)*%?', new)).issubset(set(re.findall(r'\d+(?:[./]\d+)*%?', old)))
 
-def rewrite_profile(profile, job, requirements):
-    original = profiles.evidence(profile)
+def editable_profile_entries(profile):
     # Only prose; role headings, dates, education, skills and contact remain exact.
     editable = {}
     for section in profile['sections']:
@@ -116,15 +128,27 @@ def rewrite_profile(profile, job, requirements):
         if section['title'] in ('Professional Experience','Selected Projects'):
             for i in section['items']:
                 if not re.search(r'\d{2}/\d{4}| - |\.com\b|\.app\b',i['text']): editable[i['id']]=i['text']
+    return editable
+
+def draft_profile_rewrites(profile, job, requirements):
+    editable = editable_profile_entries(profile)
     try:
         proposed = providers.ask(providers.Rewrites,
             'Tailor the provided editable CV prose to the requirements using ONLY the facts in EACH original entry. Preserve all qualifications, scope, tense, seniority and quantities. Do not move experience between employers. Do not add any technology not already in that entry. Prefer clearer wording to keyword stuffing. Return only changed entries; keep each evidence_id.',
             {'editable_entries':editable,'requirements':requirements,'job_title':job['title']}).changes
     except Exception as exc:
         store.event(job.get('id'), f'AI prose adaptation notice: {exc}. Retaining original verified wording.')
-        return []
-
+        return editable, {}
     candidates={r.evidence_id:r.text.strip() for r in proposed if r.evidence_id in editable and r.text.strip() and guard_rewrite(editable[r.evidence_id],r.text)}
+    return editable, candidates
+
+def audit_profile_rewrites(profile, editable, candidates, job_id=None):
+    candidates = {
+        key: text.strip()
+        for key, text in candidates.items()
+        if key in editable and isinstance(text, str) and text.strip() and guard_rewrite(editable[key], text)
+    }
+    updated = copy.deepcopy(profile)
     changes=[]
     if candidates:
         try:
@@ -135,11 +159,18 @@ def rewrite_profile(profile, job, requirements):
         except Exception:
             allowed=set()
 
-        for section in profile['sections']:
+        for section in updated['sections']:
             for item in section['items']:
                 if item['id'] in allowed:
                     changes.append({'id':item['id'],'before':item['text'],'after':candidates[item['id']]})
                     item['text']=candidates[item['id']]
+    return updated, changes
+
+def rewrite_profile(profile, job, requirements):
+    editable, candidates = draft_profile_rewrites(profile, job, requirements)
+    updated, changes = audit_profile_rewrites(profile, editable, candidates, job.get('id'))
+    profile.clear()
+    profile.update(updated)
     return changes
 
 def coverage(requirements, profile, ai):
@@ -177,7 +208,10 @@ def score(rows):
     total=sum(r['weight'] for r in rows)
     return round(100*sum(r['weight']*{'full':1,'partial':0.5,'missing':0}[r['support']] for r in rows)/total,1) if total else 0
 
-def prepare(job_id, mode='local', progress=None):
+def prepare(job_id, mode='local', progress=None, run_id=None):
+    if mode == 'ai':
+        from .prepare_graph import run_ai_preparation
+        return run_ai_preparation(job_id, run_id or store.uid(), progress=progress)
     if progress: progress('Reading job details and master profile…')
     job=store.get_job(job_id)
     if job['state'] in ('submitted','submitting','uncertain'):

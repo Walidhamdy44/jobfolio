@@ -26,6 +26,26 @@ PAGE_HEIGHT_PT = 841.89
 LEFT_MARGIN_PT = 38
 RIGHT_MARGIN_PT = 38
 PRINTABLE_WIDTH_PT = PAGE_WIDTH_PT - LEFT_MARGIN_PT - RIGHT_MARGIN_PT
+_DATE_PART = r'(?:\d{1,2}/\d{4}|(?:19|20)\d{2}|present|current|now)'
+_EXPERIENCE_DATE_RANGE = re.compile(
+    rf'^\s*{_DATE_PART}\s*(?:-|–|—|to)\s*{_DATE_PART}(?:\s*\([^)]*\))?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _is_experience_date(text):
+    return bool(
+        _EXPERIENCE_DATE_RANGE.fullmatch(text.strip())
+        or re.fullmatch(r'(?:freelance|internship)', text.strip(), re.IGNORECASE)
+    )
+
+
+def _is_experience_role_title(items, index):
+    for item in items[index + 1:]:
+        text = item.get('text', '').strip()
+        if text:
+            return _is_experience_date(text)
+    return False
 
 def _create_divider(width=PRINTABLE_WIDTH_PT, color_hex='#246952', thickness=1.2):
     d = Drawing(width, 4)
@@ -87,12 +107,22 @@ def generate(profile, package_id):
 
     for section in profile['sections']:
         doc.add_paragraph(section['title'].upper(), 'Heading 1')
-        for index, item in enumerate(section['items']):
+        items = section['items']
+        is_experience = section['title'].strip().casefold() == 'professional experience'
+        for index, item in enumerate(items):
             text = item['text'].strip()
             p = doc.add_paragraph()
             if is_cover_letter:
                 p.add_run(text)
                 p.paragraph_format.space_after = Pt(6)
+            elif is_experience and _is_experience_role_title(items, index):
+                p.paragraph_format.keep_with_next = True
+                p.paragraph_format.space_before = Pt(4)
+                p.paragraph_format.space_after = Pt(1)
+                run = p.add_run(text)
+                run.bold = True
+                run.font.size = Pt(10.5)
+                run.font.color.rgb = RGBColor(15, 23, 42)
             elif re.search(r'\d{2}/\d{4}|Present\b|Freelance\b|Internship\b', text):
                 p.paragraph_format.keep_with_next = True
                 p.paragraph_format.space_before = Pt(4)
@@ -198,6 +228,14 @@ def generate(profile, package_id):
             spaceAfter=2,
             keepWithNext=True
         )
+        role_title_style = ParagraphStyle(
+            'RoleTitle',
+            parent=role_header_style,
+            fontSize=10.5,
+            leading=13.5,
+            spaceBefore=5,
+            spaceAfter=1,
+        )
         cover_body_style = ParagraphStyle(
             'CoverLetterBody',
             fontName='Helvetica',
@@ -229,7 +267,10 @@ def generate(profile, package_id):
             story.append(Spacer(1, 3))
 
             group = []
-            for item in section['items']:
+            pending_role_title = None
+            items = section['items']
+            is_experience = sec_title.casefold() == 'professional experience'
+            for index, item in enumerate(items):
                 raw = item['text'].strip()
                 if not raw:
                     continue
@@ -242,26 +283,43 @@ def generate(profile, package_id):
                     cat, vals = raw.split(':', 1)
                     styled_skill = f"<b>{escape(cat)}:</b>{escape(vals)}"
                     story.append(Paragraph(styled_skill, body_style))
-                elif re.search(r'\d{2}/\d{4}|Present\b|Freelance\b|Internship\b', raw):
+                elif is_experience and _is_experience_role_title(items, index):
                     if group:
                         story.append(KeepTogether(group))
                         group = []
-                    # Emphasize role header
                     styled_role = f"<b>{escape(raw)}</b>"
-                    role_p = Paragraph(styled_role, role_header_style)
-                    if sec_title == 'Professional Experience':
-                        group.append(role_p)
+                    pending_role_title = Paragraph(styled_role, role_title_style)
+                elif (
+                    _is_experience_date(raw)
+                    if is_experience
+                    else bool(re.search(r'\d{2}/\d{4}|Present\b|Freelance\b|Internship\b', raw))
+                ):
+                    if group:
+                        story.append(KeepTogether(group))
+                        group = []
+                    styled_date = f"<b>{escape(raw)}</b>"
+                    date_p = Paragraph(styled_date, role_header_style)
+                    if is_experience:
+                        if pending_role_title:
+                            group.append(pending_role_title)
+                            pending_role_title = None
+                        group.append(date_p)
                     else:
-                        story.append(role_p)
+                        story.append(date_p)
                 else:
                     # Formatted bullet point
                     bullet_text = f"&bull;&nbsp;&nbsp;{escape(raw)}"
                     bp = Paragraph(bullet_text, bullet_style)
-                    if sec_title == 'Professional Experience':
+                    if is_experience:
+                        if pending_role_title:
+                            group.append(pending_role_title)
+                            pending_role_title = None
                         group.append(bp)
                     else:
                         story.append(bp)
 
+            if pending_role_title:
+                group.append(pending_role_title)
             if group:
                 story.append(KeepTogether(group))
 

@@ -5,35 +5,32 @@ export function SettingsLayout() {
   const context = useOutletContext()
 
   return (
-    <div>
-      <div className="page-heading">
-        <div>
-          <h1>Give your agent its tools.</h1>
-          <p>
-            100% free operation: Discover jobs from public feeds and use free AI models. Offline
-            manual entry always works.
-          </p>
-        </div>
-      </div>
+    <div className="settings-layout">
+      <header className="settings-intro">
+        <h1>Give your agent its tools.</h1>
+        <p>
+          100% free operation: Discover jobs from public feeds and use free AI models. Offline
+          manual entry always works.
+        </p>
+      </header>
 
-      <div className="filter-tabs" style={{ marginBottom: '24px' }}>
+      <nav className="settings-tabs" aria-label="Settings sections">
         <NavLink
           to="/settings/ai"
-          className={({ isActive }) => (isActive ? 'selected' : '')}
-          style={{ textDecoration: 'none' }}
+          end
+          className="settings-tab"
         >
           <Sparkles size={15} />
           AI Connections & Models
         </NavLink>
         <NavLink
           to="/settings/search"
-          className={({ isActive }) => (isActive ? 'selected' : '')}
-          style={{ textDecoration: 'none' }}
+          className="settings-tab"
         >
           <Search size={15} />
           Job Search Sources
         </NavLink>
-      </div>
+      </nav>
 
       <Outlet context={context} />
     </div>

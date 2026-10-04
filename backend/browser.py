@@ -1,11 +1,14 @@
 """Conservative hosted-form adapter. Unknown controls stop instead of guessing."""
 import re
+from threading import Event, Lock
 from urllib.parse import urlparse
 # pyrefly: ignore [missing-import]
 from playwright.sync_api import sync_playwright
 from . import store, network
 
 EASY_APPLY_MODAL_SELECTOR = 'dialog[open], div[role="dialog"], .jobs-easy-apply-modal'
+_AUTO_APPLY_CONTINUE_EVENTS: dict[str, Event] = {}
+_AUTO_APPLY_CONTINUE_LOCK = Lock()
 
 FIELDS_JS = r'''() => {
  const els=[...document.querySelectorAll('input,textarea,select')];
@@ -185,30 +188,95 @@ def open_user_browser_session(url: str = 'https://www.linkedin.com'):
 
 def _extract_element_label(el, page) -> str:
     try:
-        # Check aria-label or placeholder
-        aria = el.get_attribute('aria-label') or el.get_attribute('placeholder') or ''
+        aria = el.get_attribute('aria-label') or ''
         if aria:
             return aria.strip()
-        # Check associated label
-        el_id = el.get_attribute('id')
-        if el_id:
-            lbl = page.locator(f'label[for="{el_id}"]').first
-            if lbl.count():
-                return lbl.inner_text().strip()
-        # Check parent label or preceding text
+        labelled_by = el.evaluate(r"""e => (e.getAttribute('aria-labelledby') || '').split(/\s+/)
+            .map(id => document.getElementById(id)?.innerText || '').filter(Boolean).join(' ').trim()""")
+        if labelled_by:
+            return re.sub(r'\s+', ' ', labelled_by).strip()
+        labels = el.evaluate("""e => Array.from(e.labels || []).map(label => label.innerText || '').join(' ').trim()""")
+        if labels:
+            return re.sub(r'\s+', ' ', labels).strip()
         parent_lbl = el.locator('xpath=ancestor::label').first
         if parent_lbl.count():
-            return parent_lbl.inner_text().strip()
-        # Check fieldset legend or parent container text
-        container = el.locator('xpath=ancestor::div[contains(@class, "fb-dash-form-element") or contains(@class, "jobs-easy-apply-form-section__grouping") or contains(@class, "form-group") or contains(@class, "field")]').first
+            return re.sub(r'\s+', ' ', parent_lbl.inner_text()).strip()
+        fieldset = el.locator('xpath=ancestor::fieldset[1]').first
+        if fieldset.count():
+            legend = fieldset.locator('legend').first
+            if legend.count() and legend.inner_text().strip():
+                return re.sub(r'\s+', ' ', legend.inner_text()).strip()
+        container = el.locator(
+            'xpath=ancestor::div[contains(@class, "fb-dash-form-element") or '
+            'contains(@class, "jobs-easy-apply-form-section__grouping") or '
+            'contains(@class, "form-group") or contains(@class, "field")][1]'
+        ).first
         if container.count():
             txt = container.inner_text().split('\n')[0]
             if txt:
                 return txt.strip()
+        placeholder = el.get_attribute('placeholder') or ''
+        if placeholder:
+            return placeholder.strip()
         name = el.get_attribute('name') or ''
         return name
     except Exception:
         return ''
+
+
+def _extract_element_context(el, page) -> str:
+    """Collect the question, group prompt and nearby instructions for interpretation."""
+    parts = []
+    try:
+        fieldset = el.locator('xpath=ancestor::fieldset[1]').first
+        if fieldset.count():
+            parts.append(fieldset.inner_text())
+        else:
+            group = el.locator(
+                'xpath=ancestor::*[@role="group" or @role="radiogroup" or '
+                'contains(@class, "fb-dash-form-element") or '
+                'contains(@class, "jobs-easy-apply-form-section__grouping") or '
+                'contains(@class, "form-group") or contains(@class, "field")][1]'
+            ).first
+            if group.count():
+                parts.append(group.inner_text())
+    except Exception:
+        pass
+    try:
+        described_by = el.evaluate(r"""e => (e.getAttribute('aria-describedby') || '').split(/\s+/)
+            .map(id => document.getElementById(id)?.innerText || '').filter(Boolean).join(' ')""")
+        if described_by:
+            parts.append(described_by)
+    except Exception:
+        pass
+    if not parts:
+        parts.append(_extract_element_label(el, page))
+    context = re.sub(r'\s+', ' ', ' '.join(part for part in parts if part)).strip()
+    return context[:1600]
+
+
+def _extract_group_label(el, page) -> str:
+    try:
+        fieldset = el.locator('xpath=ancestor::fieldset[1]').first
+        if fieldset.count():
+            legend = fieldset.locator('legend').first
+            if legend.count() and legend.inner_text().strip():
+                return re.sub(r'\s+', ' ', legend.inner_text()).strip()
+    except Exception:
+        pass
+    return _extract_element_label(el, page)
+
+
+def _control_key(el, label: str, field_type: str, index: int) -> str:
+    try:
+        key = el.evaluate("""e => e.id ? '#' + CSS.escape(e.id) : e.name ?
+            e.tagName.toLowerCase() + '[name=' + JSON.stringify(e.name) + ']' +
+            (e.type === 'radio' ? '[value=' + JSON.stringify(e.value) + ']' : '') : ''""")
+        if key:
+            return key
+    except Exception:
+        pass
+    return f'{field_type}:{index}:{label.casefold()}'
 
 def _safe_count(locator) -> int:
     try:
@@ -218,24 +286,76 @@ def _safe_count(locator) -> int:
         return 0
 
 
-def _handoff_to_user(page, job_id: str, message: str, progress=None, *, needs_input: bool = True, headless: bool = False) -> str:
-    """Keep the controlled browser open until the person closes its tab."""
-    store.update_job(
-        job_id,
-        state='needs_input' if needs_input else 'awaiting_review',
-        input_request=message,
-    )
+def request_auto_apply_continue(job_id: str) -> None:
+    """Wake the active co-pilot after the user finishes a pending browser step."""
+    with _AUTO_APPLY_CONTINUE_LOCK:
+        continue_event = _AUTO_APPLY_CONTINUE_EVENTS.get(job_id)
+        if continue_event is None:
+            raise ValueError('Auto-Apply is no longer waiting in an open browser. Start Co-Pilot again to continue.')
+        if continue_event.is_set():
+            raise ValueError('The Auto-Apply agent is already continuing.')
+        job = store.get_job(job_id)
+        if job['state'] != 'needs_input':
+            raise ValueError('The Auto-Apply agent is not waiting for your input.')
+        store.update_job(job_id, state='submitting', input_request=None)
+        continue_event.set()
+
+
+def _handoff_to_user(page, job_id: str, message: str, progress=None, *, needs_input: bool = True, headless: bool = False) -> bool:
+    """Pause for user input and return True only when the same agent can continue."""
+    continue_event = Event() if needs_input and not headless else None
+    if continue_event is not None:
+        with _AUTO_APPLY_CONTINUE_LOCK:
+            _AUTO_APPLY_CONTINUE_EVENTS[job_id] = continue_event
+
+    try:
+        store.update_job(
+            job_id,
+            state='needs_input' if needs_input else 'awaiting_review',
+            input_request=message,
+        )
+    except Exception:
+        if continue_event is not None:
+            with _AUTO_APPLY_CONTINUE_LOCK:
+                if _AUTO_APPLY_CONTINUE_EVENTS.get(job_id) is continue_event:
+                    _AUTO_APPLY_CONTINUE_EVENTS.pop(job_id, None)
+        raise
     if progress:
-        progress(f'Input needed: {message}')
+        progress(f'{"Input needed" if needs_input else "Manual review"}: {message}')
     else:
-        store.event(job_id, f'Input needed: {message}')
-    if not headless:
+        store.event(job_id, f'{"Input needed" if needs_input else "Manual review"}: {message}')
+
+    if headless:
+        return False
+
+    if continue_event is not None:
         try:
-            if not page.is_closed():
-                page.wait_for_event('close', timeout=0)
+            while not page.is_closed():
+                if continue_event.wait(timeout=0.25):
+                    if page.is_closed():
+                        store.update_job(
+                            job_id,
+                            state='needs_input',
+                            input_request='The employer browser closed before Auto-Apply could continue. Start Co-Pilot again to retry.',
+                        )
+                        return False
+                    if progress:
+                        progress('Continuing after your input…')
+                    return True
         except Exception:
             pass
-    return message
+        finally:
+            with _AUTO_APPLY_CONTINUE_LOCK:
+                if _AUTO_APPLY_CONTINUE_EVENTS.get(job_id) is continue_event:
+                    _AUTO_APPLY_CONTINUE_EVENTS.pop(job_id, None)
+        return False
+
+    try:
+        if not page.is_closed():
+            page.wait_for_event('close', timeout=0)
+    except Exception:
+        pass
+    return False
 
 
 def _unresolved_required_fields(page, container) -> list[str]:
@@ -376,11 +496,17 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
                 try:
                     modal.wait_for(state='visible', timeout=12000)
                 except Exception:
-                    return _handoff_to_user(
-                        page, job_id,
-                        'Easy Apply opened, but the form was not detected. Check this browser tab and continue manually.',
-                        progress, headless=headless,
-                    )
+                    message = 'Easy Apply opened, but the form was not detected. Check this browser tab, open the form, then continue here.'
+                    if not _handoff_to_user(page, job_id, message, progress, headless=headless):
+                        return message
+                    modal = page.locator(EASY_APPLY_MODAL_SELECTOR).first
+                    try:
+                        modal.wait_for(state='visible', timeout=5000)
+                    except Exception:
+                        message = 'The Easy Apply form is still not visible. Open it in the browser, then continue here.'
+                        if not _handoff_to_user(page, job_id, message, progress, headless=headless):
+                            return message
+                        modal = page.locator(EASY_APPLY_MODAL_SELECTOR).first
 
                 # 3. Handle Easy Apply modal traversal
                 max_steps = 12
@@ -390,15 +516,16 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
                     step += 1
                     modal = page.locator(EASY_APPLY_MODAL_SELECTOR).first
                     if not _safe_count(modal) or not modal.is_visible():
-                        return _handoff_to_user(
-                            page, job_id,
-                            'The Easy Apply form is no longer visible. Check the posting in this browser tab.',
-                            progress, headless=headless,
-                        )
+                        message = 'The Easy Apply form is no longer visible. Reopen it in the browser, then continue here.'
+                        if _handoff_to_user(page, job_id, message, progress, headless=headless):
+                            continue
+                        return message
 
                     if blocked(page):
-                        store.update_job(job_id, state='needs_input')
-                        raise ValueError('Human verification or security challenge detected on LinkedIn. Complete it in the browser.')
+                        message = 'Complete the LinkedIn verification in the browser, then continue here.'
+                        if _handoff_to_user(page, job_id, message, progress, headless=headless):
+                            continue
+                        return message
 
                     if progress:
                         progress(f'Answering questions on application step {step}…')
@@ -429,10 +556,10 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
                         unresolved.append(upload_issue)
                     if unresolved:
                         names = ', '.join(dict.fromkeys(unresolved))[:350]
-                        return _handoff_to_user(
-                            page, job_id, f'Complete these employer fields: {names}. The browser will stay open.',
-                            progress, headless=headless,
-                        )
+                        message = f'Complete these employer fields: {names}. The browser will stay open.'
+                        if _handoff_to_user(page, job_id, message, progress, headless=headless):
+                            continue
+                        return message
 
                     # Check navigation buttons
                     submit_btn = modal.locator('button:has-text("Submit application"), button[aria-label="Submit application"]').first
@@ -501,10 +628,12 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
                                 if cv_attached else
                                 'Review the employer form and select the correct CV before submitting. The browser will stay open.'
                             )
-                            return _handoff_to_user(
+                            if _handoff_to_user(
                                 page, job_id, review_message, progress,
                                 needs_input=not cv_attached, headless=headless,
-                            )
+                            ):
+                                continue
+                            return review_message
 
                     elif has_review:
                         review_btn.click()
@@ -513,16 +642,15 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
                         next_btn.click()
                         page.wait_for_timeout(1500)
                     else:
-                        return _handoff_to_user(
-                            page, job_id,
-                            'The agent cannot find the next application step. Continue in this browser tab.',
-                            progress, headless=headless,
-                        )
+                        message = 'The agent cannot find the next application step. Complete it in the browser, then continue here.'
+                        if _handoff_to_user(page, job_id, message, progress, headless=headless):
+                            continue
+                        return message
 
                 return _handoff_to_user(
                     page, job_id,
-                    'The application has more steps than the agent can verify. Continue in this browser tab.',
-                    progress, headless=headless,
+                    'The application has more steps than the agent can safely handle. Finish the remaining steps manually in the browser.',
+                    progress, needs_input=False, headless=headless,
                 )
             else:
                 return _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_submit, progress, headless=headless)
@@ -532,91 +660,200 @@ def auto_apply_job(job_id: str, auto_submit: bool = False, headless: bool = Fals
             raise
 
 def _fill_container_fields(page, container, profile, job, package, prefs):
-    """Detect and fill form controls within a container element using form_engine."""
+    """Read full field context, prefer verified profile facts, then batch-audit AI answers."""
     from . import form_engine
     if 'answers' not in package or not isinstance(package.get('answers'), dict):
         package['answers'] = {}
     answers = package['answers']
     unresolved = []
+    pending = []
 
-    # 1. Text, number, email, tel, textarea inputs
-    inputs = container.locator('input[type="text"]:visible, input[type="email"]:visible, input[type="tel"]:visible, input[type="number"]:visible, input:not([type]):visible, textarea:visible')
+    def field_details(el, field_type, options, index, label=None):
+        label = label or _extract_element_label(el, page) or 'an employer-required field'
+        return {
+            'key': _control_key(el, label, field_type, index),
+            'label': label,
+            'context': _extract_element_context(el, page),
+            'type': field_type,
+            'options': options or [],
+            'max_length': int(el.get_attribute('maxlength')) if (el.get_attribute('maxlength') or '').isdigit() else None,
+        }
+
+    def required_field(el, label):
+        return (
+            el.get_attribute('required') is not None
+            or el.get_attribute('aria-required') == 'true'
+            or '*' in label
+        )
+
+    def queue_or_fill(field, el, required, kind='text'):
+        label = field['label']
+        key = field['key']
+        current = ''
+        try:
+            current = str(el.input_value() or '').strip()
+        except Exception:
+            pass
+        if current:
+            # Preserve reviewed answers and exact profile autofill. Unknown prefilled values
+            # are handed to the user instead of silently being treated as correct.
+            stored = answers.get(key)
+            if stored is None:
+                stored = answers.get(label)
+            if stored is not None and str(stored).strip().casefold() == current.casefold():
+                return
+            known = form_engine.answer_single_field(field, profile, job, package, prefs, allow_ai=False)
+            if known and str(known).strip().casefold() == current.casefold():
+                answers[key] = current
+                return
+            if required:
+                unresolved.append('Review the prefilled answer for: ' + label)
+            return
+
+        answer = form_engine.answer_single_field(field, profile, job, package, prefs, allow_ai=False)
+        if answer:
+            if field['options']:
+                answer = form_engine._exact_option(field['options'], str(answer)) or ''
+            if answer:
+                try:
+                    if kind == 'select':
+                        el.select_option(value=str(answer))
+                    else:
+                        el.fill(str(answer))
+                    answers[key] = str(answer)
+                    page.wait_for_timeout(150)
+                    return
+                except Exception:
+                    pass
+        if form_engine.can_answer_from_cv(field):
+            pending.append({'field': field, 'controls': [el], 'required': required, 'kind': kind})
+        elif required:
+            unresolved.append(label)
+
+    # 1. Scalar fields. The whole nearby question and its instructions go to the
+    # interpreter, not just a placeholder or truncated label.
+    inputs = container.locator(
+        'input[type="text"]:visible, input[type="email"]:visible, input[type="tel"]:visible, '
+        'input[type="url"]:visible, input[type="number"]:visible, input[type="date"]:visible, '
+        'input:not([type]):visible, textarea:visible'
+    )
     for i in range(_safe_count(inputs)):
         el = inputs.nth(i)
-        label = 'an employer-required field'
-        required = False
         try:
-            label = _extract_element_label(el, page) or label
-            required = el.get_attribute('required') is not None or el.get_attribute('aria-required') == 'true' or '*' in label
-            curr = el.input_value()
-            if curr and len(curr) > 1:
-                continue
-            field_dict = {'label': label, 'type': el.get_attribute('type') or 'text', 'options': []}
-            ans = form_engine.answer_single_field(field_dict, profile, job, package, prefs)
-            if ans:
-                el.fill(str(ans))
-                answers[label] = str(ans)
-                page.wait_for_timeout(200)
-            elif required:
-                unresolved.append(label)
+            field_type = el.get_attribute('type') or ('textarea' if el.evaluate("e => e.tagName === 'TEXTAREA'") else 'text')
+            field = field_details(el, field_type, [], i)
+            queue_or_fill(field, el, required_field(el, field['label']))
         except Exception:
-            if required:
-                unresolved.append(label)
+            unresolved.append(_extract_element_label(el, page) or 'an employer-required field')
 
-    # 2. Select dropdowns
+    # 2. Selects include the real option labels/values in the interpretation.
     selects = container.locator('select:visible')
     for i in range(_safe_count(selects)):
         el = selects.nth(i)
-        label = 'an employer-required selection'
-        required = False
         try:
-            label = _extract_element_label(el, page) or label
-            required = el.get_attribute('required') is not None or el.get_attribute('aria-required') == 'true' or '*' in label
-            if el.input_value():
-                continue
             opts = el.locator('option')
             opt_list = []
             for o in range(_safe_count(opts)):
                 opt_el = opts.nth(o)
                 opt_list.append({'value': opt_el.get_attribute('value') or '', 'label': opt_el.inner_text().strip()})
-            field_dict = {'label': label, 'type': 'select', 'options': opt_list}
-            ans = form_engine.answer_single_field(field_dict, profile, job, package, prefs)
-            if ans:
-                try:
-                    el.select_option(value=str(ans))
-                except Exception:
-                    el.select_option(label=str(ans))
-                answers[label] = str(ans)
-                page.wait_for_timeout(200)
-            elif required:
-                unresolved.append(label)
+            field = field_details(el, 'select', opt_list, i)
+            queue_or_fill(field, el, required_field(el, field['label']), kind='select')
         except Exception:
-            if required:
-                unresolved.append(label)
+            unresolved.append(_extract_element_label(el, page) or 'an employer-required selection')
 
-    # 3. Radio groups
-    radios = container.locator('input[type="radio"]:visible, div[role="radio"]:visible')
+    # 3. Group native radio buttons so the AI sees the prompt and every available choice.
+    radios = container.locator('input[type="radio"]:visible')
+    radio_groups = {}
     for i in range(_safe_count(radios)):
         el = radios.nth(i)
-        label = 'an employer-required choice'
-        required = False
         try:
-            label = _extract_element_label(el, page) or label
-            required = el.get_attribute('required') is not None or el.get_attribute('aria-required') == 'true'
-            if el.is_checked():
-                continue
-            field_dict = {'label': label, 'type': 'radio', 'options': []}
-            ans = form_engine.answer_single_field(field_dict, profile, job, package, prefs)
-            if ans and ans.casefold() in ('yes', 'true', '1'):
-                if not any(k in label.casefold() for k in ('not authorized', 'disagree', 'no')):
-                    el.check()
-                    answers[label] = 'true'
-                    page.wait_for_timeout(200)
-            elif required:
-                unresolved.append(label)
+            name = el.get_attribute('name') or ''
+            context = _extract_element_context(el, page)
+            group_key = 'name:' + name if name else 'context:' + re.sub(r'\s+', ' ', context).casefold()
+            radio_groups.setdefault(group_key, []).append(el)
         except Exception:
-            if required:
-                unresolved.append(label)
+            continue
+
+    for group_index, controls in enumerate(radio_groups.values()):
+        first = controls[0]
+        label = _extract_group_label(first, page) or 'an employer-required choice'
+        options = []
+        option_keys = []
+        required = False
+        selected = None
+        for control_index, control in enumerate(controls):
+            value = control.get_attribute('value') or ''
+            option_label = _extract_element_label(control, page)
+            options.append({'value': value, 'label': option_label})
+            option_keys.append(_control_key(control, option_label or label, 'radio', control_index))
+            required = required or required_field(control, label)
+            try:
+                if control.is_checked():
+                    selected = value
+            except Exception:
+                pass
+        field = field_details(first, 'radio', options, group_index, label=label)
+        field['key'] = 'radio-group:' + str(group_index)
+        if selected:
+            for control, option_key in zip(controls, option_keys):
+                answers[option_key] = 'true' if (control.get_attribute('value') or '') == selected else 'false'
+            continue
+        answer = form_engine.answer_single_field(field, profile, job, package, prefs, allow_ai=False)
+        if answer:
+            answer = form_engine._exact_option(options, str(answer)) or ''
+            matched = next((control for control in controls if (control.get_attribute('value') or '') == answer), None)
+            if matched:
+                try:
+                    matched.check()
+                    for control, option_key in zip(controls, option_keys):
+                        answers[option_key] = 'true' if control == matched else 'false'
+                    page.wait_for_timeout(150)
+                    continue
+                except Exception:
+                    pass
+        if form_engine.can_answer_from_cv(field):
+            pending.append({'field': field, 'controls': controls, 'control_keys': option_keys, 'required': required, 'kind': 'radio'})
+        elif required:
+            unresolved.append(label)
+
+    # Custom factual questions are drafted as one batch, then independently audited
+    # against only the cited CV evidence before any answer is typed into the page.
+    ai_answers = form_engine.answer_open_questions(
+        [item['field'] for item in pending], profile, job,
+    )
+    for item in pending:
+        field = item['field']
+        value = ai_answers.get(field['key'])
+        if not value:
+            if item['required']:
+                unresolved.append(field['label'])
+            continue
+        try:
+            if item['kind'] == 'radio':
+                matched = next((
+                    control for control in item['controls']
+                    if (control.get_attribute('value') or '') == value
+                ), None)
+                if matched is None:
+                    raise ValueError('Audited choice no longer matches the form options.')
+                matched.check()
+                for control, option_key in zip(item['controls'], item['control_keys']):
+                    answers[option_key] = 'true' if control == matched else 'false'
+            elif item['kind'] == 'select':
+                item['controls'][0].select_option(value=value)
+                answers[field['key']] = value
+            else:
+                item['controls'][0].fill(value)
+                answers[field['key']] = value
+            page.wait_for_timeout(150)
+        except Exception:
+            if item['required']:
+                unresolved.append(field['label'])
+
+    # Custom ARIA radio widgets are not mapped heuristically. They require user review.
+    custom_radios = container.locator('div[role="radio"]:visible')
+    if _safe_count(custom_radios):
+        unresolved.append('Review the employer’s custom choice controls in the browser.')
 
     try:
         if package.get('id'):
@@ -631,6 +868,11 @@ def _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_subm
     if progress:
         progress('Inspecting page for application form controls…')
     page.wait_for_timeout(2000)
+    if blocked(page):
+        message = 'Complete the employer sign-in or verification in the browser, then continue here.'
+        if _handoff_to_user(page, job_id, message, progress, headless=headless):
+            return _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_submit, progress, headless=headless)
+        return message
 
     # Attach CV to any file upload element
     cv_attached = False
@@ -662,10 +904,10 @@ def _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_subm
         unresolved.append(upload_issue)
     if unresolved:
         names = ', '.join(dict.fromkeys(unresolved))[:350]
-        return _handoff_to_user(
-            page, job_id, f'Complete these employer fields: {names}. The browser will stay open.',
-            progress, headless=headless,
-        )
+        message = f'Complete these employer fields: {names}. The browser will stay open.'
+        if _handoff_to_user(page, job_id, message, progress, headless=headless):
+            return _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_submit, progress, headless=headless)
+        return message
 
     submit_btn = page.locator('button:has-text("Submit application"), button:has-text("Apply now"), button:has-text("Submit"), input[type="submit"]').first
     has_submit = False
@@ -740,5 +982,5 @@ def _handle_generic_form(page, job, package, prefs, profile, pdf_path, auto_subm
     return _handoff_to_user(
         page, job_id,
         'No supported final application control was found. Continue manually in this browser tab.',
-        progress, headless=headless,
+        progress, needs_input=False, headless=headless,
     )

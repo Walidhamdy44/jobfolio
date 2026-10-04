@@ -7,31 +7,67 @@ import {
   ChevronLeft,
   ChevronRight,
   CheckCircle2,
+  BriefcaseBusiness,
+  Building2,
+  Compass,
+  Globe2,
+  House,
+  Laptop,
+  Linkedin,
+  MapPin,
+  ShieldCheck,
+  Sparkles,
 } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
 import { Button } from '../../shared/ui/Button'
 import { Empty } from '../../shared/ui/Empty'
+import { CompanyLogo } from '../../shared/ui/CompanyLogo'
 import { useSearchMutation } from '../../features/workspace/queries'
 import { useImportJobMutation } from '../../features/jobs/queries'
 import type { Bootstrap } from '../../types'
 
 const ITEMS_PER_PAGE = 25
 
-function formatPlatformName(platform: string, source?: string) {
-  if (source && source !== 'Feed search') return source
-  const map: Record<string, string> = {
-    weworkremotely: 'WeWorkRemotely',
-    jobicy: 'Jobicy',
-    remotive: 'Remotive',
-    arbeitnow: 'Arbeitnow',
-    linkedin: 'LinkedIn',
-    google: 'Google Jobs',
-    greenhouse: 'Greenhouse',
-    lever: 'Lever',
-    manual: 'Web posting',
-    web: 'Brave Search',
-    pasted: 'Pasted',
+type PlatformMeta = { label: string; tone: string; Icon: LucideIcon; matches: string[] }
+
+const platformMetas: PlatformMeta[] = [
+  { label: 'LinkedIn Jobs', tone: 'linkedin', Icon: Linkedin, matches: ['linkedin'] },
+  { label: 'Wuzzuf', tone: 'wuzzuf', Icon: BriefcaseBusiness, matches: ['wuzzuf'] },
+  { label: 'Indeed', tone: 'indeed', Icon: Globe2, matches: ['indeed'] },
+  { label: 'Forasna', tone: 'forasna', Icon: Building2, matches: ['forasna'] },
+  { label: 'Bayt', tone: 'bayt', Icon: House, matches: ['bayt'] },
+  { label: 'Tanqeeb', tone: 'tanqeeb', Icon: Search, matches: ['tanqeeb'] },
+  { label: 'Naukri Gulf', tone: 'naukrigulf', Icon: Compass, matches: ['naukri gulf', 'naukrigulf'] },
+  { label: 'GulfTalent', tone: 'gulftalent', Icon: Sparkles, matches: ['gulftalent'] },
+  { label: 'Akhtaboot', tone: 'akhtaboot', Icon: MapPin, matches: ['akhtaboot'] },
+  { label: 'Remotive', tone: 'remotive', Icon: Laptop, matches: ['remotive'] },
+  { label: 'Jobicy', tone: 'jobicy', Icon: BriefcaseBusiness, matches: ['jobicy'] },
+  { label: 'Arbeitnow', tone: 'arbeitnow', Icon: Building2, matches: ['arbeitnow'] },
+  { label: 'WeWorkRemotely', tone: 'weworkremotely', Icon: Globe2, matches: ['weworkremotely'] },
+  { label: 'Brave Search', tone: 'brave', Icon: ShieldCheck, matches: ['brave'] },
+  { label: 'Google Search', tone: 'google', Icon: Search, matches: ['google', 'serper'] },
+]
+
+function platformMeta(platform: string, source?: string): PlatformMeta {
+  const identity = `${source || ''} ${platform}`.toLowerCase()
+  return platformMetas.find((meta) => meta.matches.some((match) => identity.includes(match))) || {
+    label: source && source !== 'Feed search' ? source : (platform || 'Job source'),
+    tone: 'other',
+    Icon: BriefcaseBusiness,
+    matches: [],
   }
-  return map[platform.toLowerCase()] || platform
+}
+
+function PlatformBadge({ platform, source }: { platform: string; source?: string }) {
+  const meta = platformMeta(platform, source)
+  const Icon = meta.Icon
+
+  return (
+    <span className={`platform-tag platform-tag--${meta.tone}`}>
+      <Icon size={11} aria-hidden="true" />
+      {meta.label}
+    </span>
+  )
 }
 
 export function DiscoverPage() {
@@ -47,6 +83,13 @@ export function DiscoverPage() {
 
   const query = searchParams.get('q') || ''
   const trimmedQuery = query.trim().toLowerCase()
+  const searchProvider = data?.connections.search_provider || 'free'
+  const searchSourceName = searchProvider === 'serper' || searchProvider === 'google'
+    ? 'Google Search via Serper'
+    : searchProvider === 'brave'
+    ? 'Brave Search'
+    : 'LinkedIn and curated feeds'
+  const latestSearchRun = data?.runs?.find((run) => run.kind === 'search')
 
   const setQuery = (newQuery: string) => {
     setSearchParams((prev) => {
@@ -105,7 +148,7 @@ export function DiscoverPage() {
   const handleStartSearch = async () => {
     try {
       await searchMutation.mutateAsync()
-      setToast('Job search started across free public feeds.')
+      setToast(`Job search started with ${searchSourceName}.`)
     } catch (e) {
       setToast((e as Error).message)
     }
@@ -135,7 +178,7 @@ export function DiscoverPage() {
         <div>
           <h1>Discover Opportunities</h1>
           <p>
-            Find roles matching your skills from LinkedIn, Google Jobs, and curated feeds.
+            Find roles matching your skills across connected search sources and curated feeds.
             Import them to tailor a CV.
           </p>
         </div>
@@ -156,9 +199,9 @@ export function DiscoverPage() {
         </div>
         <div>
           <h2>
-            {data?.connections.search_provider === 'serper'
-              ? 'Google Jobs search active'
-              : data?.connections.search_provider === 'brave'
+            {searchProvider === 'serper' || searchProvider === 'google'
+              ? 'Google Search job discovery active'
+              : searchProvider === 'brave'
               ? 'Brave web search active'
               : 'LinkedIn & curated feed search active'}
           </h2>
@@ -211,6 +254,7 @@ export function DiscoverPage() {
 
               return (
                 <div className="result-row" key={hit.url}>
+                  <CompanyLogo company={hit.company} logoUrl={hit.company_logo_url} />
                   <div className="result-info">
                     <div className="result-header">
                       <a href={hit.url} target="_blank" rel="noreferrer">
@@ -222,9 +266,7 @@ export function DiscoverPage() {
                           {hit.score}% Match
                         </span>
                       )}
-                      <span className="platform-tag">
-                        {formatPlatformName(hit.platform, hit.source)}
-                      </span>
+                      <PlatformBadge platform={hit.platform} source={hit.source} />
                       {hit.posted_at && (
                         <time className="small" dateTime={hit.posted_at}>
                           Posted {new Date(hit.posted_at).toLocaleDateString(undefined, {
@@ -323,7 +365,11 @@ export function DiscoverPage() {
           </Empty>
         ) : (
           <Empty
-            title="No discovered jobs yet"
+            title={latestSearchRun?.state === 'failed'
+              ? `${searchSourceName} search failed`
+              : data?.search_results?.at
+              ? `No ${searchSourceName} results found`
+              : 'No discovered jobs yet'}
             icon="jobs"
             action={
               <Button
@@ -336,7 +382,16 @@ export function DiscoverPage() {
               </Button>
             }
           >
-            Click &ldquo;Find opportunities now&rdquo; to query free tech feeds for roles matching your preferences.
+            {latestSearchRun?.state === 'failed' ? (
+              <>
+                {latestSearchRun.message}{' '}
+                <Link to="/settings/search">Review search source settings</Link>
+              </>
+            ) : data?.search_results?.at ? (
+              <>The last {searchSourceName} search returned no postings for these filters. Broaden your titles, location, or date range and try again.</>
+            ) : (
+              <>Click &ldquo;Find opportunities now&rdquo; to query {searchSourceName} for roles matching your preferences.</>
+            )}
           </Empty>
         )}
       </section>

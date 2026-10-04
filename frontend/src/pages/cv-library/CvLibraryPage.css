@@ -1,0 +1,51 @@
+.library-row > div {
+  margin-right: 0;
+}
+
+.library-row > .library-row-content {
+  flex: 1 1 0%;
+  min-width: 0;
+}
+
+.library-row > .library-actions {
+  flex: 0 0 auto;
+  min-width: 0;
+  margin-left: auto;
+  margin-right: 0;
+}
+
+@media (min-width: 651px) {
+  .library-row {
+    flex-wrap: nowrap;
+  }
+}
+
+@media (max-width: 650px) {
+  .library-row {
+    display: grid;
+    grid-template-columns: 27px minmax(0, 1fr);
+    align-items: start;
+    gap: 12px;
+  }
+
+  .library-row > svg {
+    grid-column: 1;
+    grid-row: 1;
+    margin-top: 3px;
+  }
+
+  .library-row > .library-row-content {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .library-row > .library-actions {
+    grid-column: 2;
+    grid-row: 2;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    width: 100%;
+    margin: 0;
+  }
+}

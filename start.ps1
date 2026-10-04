@@ -20,6 +20,16 @@ if (-not (Test-Path -LiteralPath $agentPython)) {
     & $agentPython -m playwright install chromium
     if ($LASTEXITCODE -ne 0) { throw 'Browser installation failed.' }
 }
+$agentGraphReady = $false
+try {
+    & $agentPython -c "import langgraph; import truststore; from langgraph.checkpoint.sqlite import SqliteSaver" 2>$null
+    $agentGraphReady = $LASTEXITCODE -eq 0
+} catch {}
+if (-not $agentGraphReady) {
+    $agentRequirements = if (Test-Path -LiteralPath 'requirements.lock.txt') { 'requirements.lock.txt' } else { 'requirements.txt' }
+    & $agentPython -m pip install -r $agentRequirements
+    if ($LASTEXITCODE -ne 0) { throw 'Python dependency installation failed.' }
+}
 if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'frontend\dist\index.html'))) {
     Push-Location -LiteralPath (Join-Path $PSScriptRoot 'frontend')
     try {

@@ -1,4 +1,6 @@
 import re
+from io import BytesIO
+from pathlib import Path
 from pypdf import PdfReader
 from . import store
 
@@ -49,14 +51,92 @@ def get_master_pdf_text():
     text = text.replace('PROFESSIONAL EXPERIENCE - CONTINUED', '').replace('\ufffd', '•')
     return text.strip(), source
 
-def structure_cv(mode='ai'):
+def master_pdf_path(source_file=None):
+    if source_file is None:
+        source_file = (store.setting('profile', {}) or {}).get('source_file', '')
+    if source_file:
+        if Path(source_file).name != source_file or Path(source_file).suffix.lower() != '.pdf':
+            return None
+        if source_file.startswith('master_cv_'):
+            uploaded = (store.DATA / source_file).resolve()
+            if uploaded.parent == store.DATA.resolve() and uploaded.is_file():
+                return uploaded
+        original = (store.ROOT / source_file).resolve()
+        if original.parent == store.ROOT.resolve() and original.is_file():
+            return original
+        return None
+    sources = sorted(store.ROOT.glob('*.pdf'))
+    if not sources:
+        return None
+    return next((path for path in sources if 'Walid_Hamdy' in path.name), sources[0])
+
+def get_master_pdf_text_for(source_file=None):
+    if not source_file:
+        return get_master_pdf_text()
+    source = master_pdf_path(source_file)
+    if not source:
+        return '', None
+    text = '\n'.join(page.extract_text() or '' for page in PdfReader(source).pages)
+    text = re.sub(r'^Page \d+\s*$', '', text, flags=re.M)
+    text = text.replace('PROFESSIONAL EXPERIENCE - CONTINUED', '').replace('\ufffd', chr(0x2022))
+    return text.strip(), source
+
+def profile_from_pdf_bytes(pdf_bytes, source_file, revision=1):
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        text = '\n'.join(page.extract_text() or '' for page in reader.pages)
+    except Exception as exc:
+        raise ValueError('Could not read this PDF. Upload a valid, text-readable CV.') from exc
+    text = re.sub(r'^Page \d+\s*$', '', text, flags=re.M)
+    text = text.replace('PROFESSIONAL EXPERIENCE - CONTINUED', '').replace('\ufffd', chr(0x2022))
+    if len(' '.join(text.split())) < 40:
+        raise ValueError('This PDF has too little selectable text. Upload a text-based CV PDF.')
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        raise ValueError('The PDF does not contain enough text to build a profile.')
+    sections, current = [], None
+    for line in lines[4:]:
+        if line in HEADINGS:
+            current = {'title': line.title(), 'items': []}
+            sections.append(current)
+        elif current:
+            items = current['items']
+            start = (not items or line.startswith(chr(0x2022)) or current['title'] == 'Technical Skills'
+                     or bool(re.match(r'(Front-End|Front-end|Bachelor|Boutiqaat E-commerce|Skyloov Property|Learning Management|Arabic:)', line)))
+            if start:
+                items.append({'id': 'e' + str(sum(len(section['items']) for section in sections) + 1), 'text': line.lstrip(chr(0x2022) + ' ').strip()})
+            else:
+                items[-1]['text'] += ' ' + line
+    sections = [section for section in sections if section['items']]
+    if not sections:
+        raise ValueError('No recognizable CV sections were found. Upload a CV with selectable text and standard section headings.')
+    contact = lines[2] if len(lines) > 2 else ''
+    email = re.search(r'[\w.+-]+@[\w.-]+', contact)
+    phone = re.search(r'\+\d[\d ]+', contact)
+    links = [value.strip() for value in lines[3].split('|')] if len(lines) > 3 else []
+    return {
+        'name': lines[0].title(),
+        'headline': lines[1],
+        'email': email[0] if email else '',
+        'phone': phone[0].strip() if phone else '',
+        'location': contact.split('|')[0].strip() if contact else '',
+        'links': links,
+        'sections': sections,
+        'source_file': source_file,
+        'revision': revision,
+    }
+
+def structure_cv(mode='ai', source_file=None):
     from . import providers
-    text, source = get_master_pdf_text()
+    if source_file is None:
+        source_file = (store.setting('profile', {}) or {}).get('source_file')
+    text, source = get_master_pdf_text_for(source_file)
     if not text:
         raise ValueError('No master CV document found in your workspace to review.')
 
     current = store.setting('profile', {})
-    source_file = current.get('source_file', source.name if source else '')
+    source_file = source.name if source else current.get('source_file', '')
     revision = current.get('revision', 1)
 
     if mode == 'ai':
@@ -84,6 +164,18 @@ def structure_cv(mode='ai'):
                     counter += 1
             if sec_items:
                 sections.append({'title': s.title.strip(), 'items': sec_items})
+
+        expected_titles = {
+            heading.title()
+            for heading in HEADINGS
+            if re.search(rf'^{re.escape(heading)}$', text, flags=re.M)
+        }
+        structured_titles = {section['title'].title() for section in sections}
+        if not expected_titles.issubset(structured_titles):
+            # Structured-output providers can occasionally return a valid but
+            # truncated response. Preserve the complete CV by falling back to
+            # deterministic parsing instead of offering an incomplete draft.
+            return structure_cv(mode='local', source_file=source_file)
 
         return {
             'name': structured.name.strip().title(),

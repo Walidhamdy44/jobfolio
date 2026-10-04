@@ -10,6 +10,7 @@ import { NewJobPage } from '../pages/jobs/NewJobPage'
 import { JobDescriptionPage } from '../pages/jobs/JobDescriptionPage'
 import { JobCvPage } from '../pages/jobs/JobCvPage'
 import { JobCoveragePage } from '../pages/jobs/JobCoveragePage'
+import { JobCoverageImprovePage } from '../pages/jobs/JobCoverageImprovePage'
 import { JobApplicationPage } from '../pages/jobs/JobApplicationPage'
 import { JobActivityPage } from '../pages/jobs/JobActivityPage'
 import { CvLibraryPage } from '../pages/cv-library/CvLibraryPage'
@@ -66,6 +67,10 @@ export const router = createBrowserRouter([
           {
             path: 'coverage',
             element: <JobCoveragePage />,
+          },
+          {
+            path: 'coverage/improve',
+            element: <JobCoverageImprovePage />,
           },
           {
             path: 'application',

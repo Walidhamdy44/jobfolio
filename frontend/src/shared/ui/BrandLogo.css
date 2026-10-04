@@ -1,0 +1,41 @@
+.brand-logo-window {
+  position: relative;
+  display: block;
+  width: 100%;
+  max-width: 192px;
+  height: 52px;
+  flex: none;
+  overflow: hidden;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.brand-logo-image {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: block;
+  width: 262px;
+  max-width: none;
+  height: auto;
+  transform: translate(-50%, -50%);
+}
+
+.brand-logo-window--loading {
+  width: 240px;
+  max-width: 100%;
+  height: 60px;
+}
+
+.brand-logo-window--loading .brand-logo-image {
+  width: 330px;
+}
+
+.sidebar .brand {
+  display: block;
+  width: 100%;
+  max-width: 192px;
+  height: 52px;
+  padding: 0;
+  line-height: 0;
+}

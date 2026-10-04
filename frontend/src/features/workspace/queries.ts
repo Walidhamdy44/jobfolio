@@ -68,7 +68,7 @@ export function useSaveProfileMutation() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (profile: Profile) =>
-      apiClient<{ ok: boolean }>('/profile', { method: 'PUT', body: profile }),
+      apiClient<{ ok: boolean; profile: Profile }>('/profile', { method: 'PUT', body: profile }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: workspaceKeys.bootstrap })
       void qc.invalidateQueries({ queryKey: jobKeys.all })
@@ -76,9 +76,19 @@ export function useSaveProfileMutation() {
   })
 }
 
+export function useUploadMasterCVMutation() {
+  return useMutation({
+    mutationFn: (file: File) =>
+      apiClient<{ profile: Profile; ok: boolean }>('/profile/master-cv', {
+        method: 'POST',
+        body: file,
+      }),
+  })
+}
+
 export function useStructureProfileMutation() {
   return useMutation({
-    mutationFn: (params: { mode: 'ai' | 'local' }) =>
+    mutationFn: (params: { mode: 'ai' | 'local'; source_file?: string }) =>
       apiClient<{ profile: Profile; ok: boolean }>('/profile/structure', {
         method: 'POST',
         body: params,

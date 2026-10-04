@@ -1,5 +1,5 @@
-import { useOutletContext } from 'react-router-dom'
-import { Check, CircleHelp, Circle, ChevronRight } from 'lucide-react'
+import { Link, useOutletContext } from 'react-router-dom'
+import { Check, CircleHelp, Circle, ChevronRight, Sparkles, ArrowRight } from 'lucide-react'
 import { useReviewDraft } from '../../features/review/ReviewDraftContext'
 import { Button } from '../../shared/ui/Button'
 import { Notice } from '../../shared/ui/Notice'
@@ -7,11 +7,12 @@ import { Empty } from '../../shared/ui/Empty'
 import type { Job, Package } from '../../types'
 
 export function JobCoveragePage() {
-  const { pkg, isLocked, setToast } = useOutletContext<{
+  const { job, pkg, isLocked, setToast, bootstrap } = useOutletContext<{
     job: Job
     pkg: Package | null
     isLocked: boolean
     setToast: (msg: string) => void
+    bootstrap?: { connections?: { connected?: boolean } }
   }>()
 
   const {
@@ -34,6 +35,8 @@ export function JobCoveragePage() {
       </Empty>
     )
   }
+
+  const missingCount = pkg.requirements.filter((requirement) => requirement.support === 'missing').length
 
   const handleSaveReview = async () => {
     try {
@@ -75,6 +78,32 @@ export function JobCoveragePage() {
         </span>
         <span>Weighting: Required (3×) · Preferred (1×)</span>
       </div>
+
+      {missingCount > 0 && (
+        <section className="coverage-improve-launch" aria-labelledby="coverage-improve-title">
+          <div className="coverage-improve-copy">
+            <Sparkles size={18} aria-hidden="true" />
+            <div>
+              <h3 id="coverage-improve-title">Work through {missingCount} missing requirements</h3>
+              <p>
+                Review the final CV beside its gaps. AI can suggest evidence-backed wording; you choose what to include.
+              </p>
+              {!bootstrap?.connections?.connected && (
+                <small>Connect an AI provider before drafting changes.</small>
+              )}
+            </div>
+          </div>
+          <Link
+            to={`/jobs/${job.id}/coverage/improve`}
+            className={`button primary${isLocked ? ' disabled-link' : ''}`}
+            aria-disabled={isLocked}
+            onClick={(event) => { if (isLocked) event.preventDefault() }}
+          >
+            Review missing requirements
+            <ArrowRight size={15} />
+          </Link>
+        </section>
+      )}
 
       {isConflicted && (
         <Notice kind="warning">

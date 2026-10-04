@@ -2,9 +2,11 @@ import type { Profile } from '../../../types'
 
 export interface CVPreviewProps {
   profile: Profile
+  highlightedIds?: string[]
 }
 
-export function CVPreview({ profile }: CVPreviewProps) {
+export function CVPreview({ profile, highlightedIds = [] }: CVPreviewProps) {
+  const highlighted = new Set(highlightedIds)
   return (
     <article className="cv-paper" aria-label="CV preview document">
       <h2>{profile.name}</h2>
@@ -20,7 +22,13 @@ export function CVPreview({ profile }: CVPreviewProps) {
         <section key={s.title}>
           <h3>{s.title}</h3>
           {s.items.map((i) => (
-            <p key={i.id} className={/\d{2}\/\d{4}/.test(i.text) ? 'cv-role' : ''}>
+            <p
+              key={i.id}
+              className={[
+                /\d{2}\/\d{4}/.test(i.text) ? 'cv-role' : '',
+                highlighted.has(i.id) ? 'cv-preview-proposed' : '',
+              ].filter(Boolean).join(' ')}
+            >
               {i.text}
             </p>
           ))}

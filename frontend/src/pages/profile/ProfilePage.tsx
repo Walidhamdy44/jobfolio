@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { Link, useOutletContext, useBlocker } from 'react-router-dom'
 import {
   Sparkles,
@@ -8,6 +8,7 @@ import {
   RotateCcw,
   Check,
   FileText,
+  Upload,
   LoaderCircle,
   ArrowRight,
 } from 'lucide-react'
@@ -16,6 +17,7 @@ import { Field } from '../../shared/ui/Field'
 import { Notice } from '../../shared/ui/Notice'
 import {
   useSaveProfileMutation,
+  useUploadMasterCVMutation,
   useStructureProfileMutation,
 } from '../../features/workspace/queries'
 import type { Bootstrap, Profile } from '../../types'
@@ -32,8 +34,11 @@ export function ProfilePage() {
   const [confirmed, setConfirmed] = useState(false)
   const [structuredNotice, setStructuredNotice] = useState('')
   const [structureError, setStructureError] = useState('')
+  const [uploadError, setUploadError] = useState('')
+  const uploadInputRef = useRef<HTMLInputElement>(null)
 
   const saveProfileMutation = useSaveProfileMutation()
+  const uploadMasterCVMutation = useUploadMasterCVMutation()
   const structureMutation = useStructureProfileMutation()
 
   useEffect(() => {
@@ -42,7 +47,34 @@ export function ProfilePage() {
     }
   }, [initialProfile])
 
-  const isModified = Boolean(p && initialProfile && JSON.stringify(p) !== JSON.stringify(initialProfile))
+  const isModified = Boolean(p && JSON.stringify(p) !== JSON.stringify(initialProfile))
+  const isAiConnected = Boolean(data?.connections?.connected)
+  const isBusy = saveProfileMutation.isPending || uploadMasterCVMutation.isPending || structureMutation.isPending
+
+  const handleUpload = async (file?: File) => {
+    setUploadError('')
+    if (!file) return
+    if (file.type && file.type !== 'application/pdf') {
+      setUploadError('Choose a PDF file.')
+      return
+    }
+    if (isModified && !window.confirm('Replace the unsaved profile edits with the uploaded CV?')) return
+    try {
+      const result = await uploadMasterCVMutation.mutateAsync(file)
+      setP(result.profile)
+      setConfirmed(false)
+      setStructureError('')
+      setStructuredNotice('CV uploaded and parsed locally. Review the extracted profile, then save to make it your master CV.')
+    } catch (e) {
+      setUploadError((e as Error).message)
+    }
+  }
+
+  const handleUploadInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.currentTarget.files?.[0]
+    e.currentTarget.value = ''
+    void handleUpload(file)
+  }
 
   // Block in-app navigation when there are unsaved changes
   const blocker = useBlocker(
@@ -61,8 +93,29 @@ export function ProfilePage() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload)
   }, [isModified])
 
-  if (!p) {
+  if (!data) {
     return <p className="muted">Loading profile…</p>
+  }
+
+  if (!p) {
+    return (
+      <>
+        <div className="page-heading">
+          <div>
+            <h1>Upload your master CV</h1>
+            <p>Your PDF is parsed on this computer. Review the extracted profile before saving it.</p>
+          </div>
+        </div>
+        <section className="editor-panel" aria-label="Upload master CV">
+          <input ref={uploadInputRef} type="file" accept="application/pdf,.pdf" onChange={handleUploadInput} style={{ display: 'none' }} />
+          <Button kind="primary" disabled={isBusy} loading={uploadMasterCVMutation.isPending} onClick={() => uploadInputRef.current?.click()}>
+            <Upload size={16} />
+            Upload master CV PDF
+          </Button>
+          {uploadError && <Notice kind="error">{uploadError}</Notice>}
+        </section>
+      </>
+    )
   }
 
   const update = (field: string, value: unknown) => {
@@ -115,7 +168,7 @@ export function ProfilePage() {
     setStructureError('')
     setStructuredNotice('')
     try {
-      const res = await structureMutation.mutateAsync({ mode })
+      const res = await structureMutation.mutateAsync({ mode, source_file: p.source_file })
       setP(res.profile)
       setConfirmed(false)
       if (mode === 'ai') {
@@ -136,17 +189,15 @@ export function ProfilePage() {
     e.preventDefault()
     if (!p) return
     try {
-      const { source_file: _s, revision: _r, ...body } = p
-      await saveProfileMutation.mutateAsync(body as Profile)
+      const { revision: _r, ...body } = p
+      const result = await saveProfileMutation.mutateAsync(body as Profile)
+      setP(result.profile)
       setToast('Master profile updated. Fresh CV packages will reflect these changes.')
       setConfirmed(false)
     } catch (err) {
       setToast((err as Error).message)
     }
   }
-
-  const isAiConnected = Boolean(data?.connections?.connected)
-  const isBusy = saveProfileMutation.isPending || structureMutation.isPending
 
   return (
     <>
@@ -155,11 +206,20 @@ export function ProfilePage() {
           <h1>The experience behind every application.</h1>
           <p>Your master profile. Every tailored CV starts here.</p>
         </div>
-        <a className="button" href="/api/master-cv" target="_blank" rel="noreferrer">
-          <ExternalLink size={15} />
-          Original CV
-        </a>
+        <div className="button-group">
+          <input ref={uploadInputRef} type="file" accept="application/pdf,.pdf" onChange={handleUploadInput} style={{ display: 'none' }} />
+          <Button disabled={isBusy} loading={uploadMasterCVMutation.isPending} onClick={() => uploadInputRef.current?.click()}>
+            <Upload size={15} />
+            Upload new CV
+          </Button>
+          <a className="button" href="/api/master-cv" target="_blank" rel="noreferrer">
+            <ExternalLink size={15} />
+            Original CV
+          </a>
+        </div>
       </div>
+
+      {uploadError && <Notice kind="error">{uploadError}</Notice>}
 
       {/* AI CV Structuring Proposal Card */}
       <section className="editor-panel profile-ai-card" aria-label="Review and structure CV">

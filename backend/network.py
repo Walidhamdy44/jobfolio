@@ -3,9 +3,19 @@ import html
 import ipaddress
 import re
 import socket
+import ssl
+import sys
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 import httpx
 from bs4 import BeautifulSoup
+
+
+def _network_ssl_context() -> ssl.SSLContext:
+    """Use the OS trust store without Python 3.14's incompatible strict flag."""
+    context = ssl.create_default_context()
+    if sys.platform == 'win32':
+        context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    return context
 
 def clean_title(text):
     if not text:
@@ -43,7 +53,12 @@ def fetch(url):
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
     }
-    with httpx.Client(timeout=25, follow_redirects=False, trust_env=False) as client:
+    with httpx.Client(
+        timeout=25,
+        follow_redirects=False,
+        trust_env=False,
+        verify=_network_ssl_context(),
+    ) as client:
         for _ in range(5):
             public_url(url)
             with client.stream('GET', url, headers=headers) as r:
@@ -113,7 +128,12 @@ def _fetch_linkedin_job(url):
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     }
-    with httpx.Client(timeout=20, follow_redirects=True, trust_env=False) as client:
+    with httpx.Client(
+        timeout=20,
+        follow_redirects=True,
+        trust_env=False,
+        verify=_network_ssl_context(),
+    ) as client:
         try:
             r = client.get(api_url, headers=headers)
             if r.status_code != 200:
@@ -158,7 +178,12 @@ def _fetch_weworkremotely_job(url):
         'https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss',
     ]
     target_clean = canonical(url).split('?')[0].rstrip('/')
-    with httpx.Client(timeout=15, follow_redirects=True, trust_env=False) as client:
+    with httpx.Client(
+        timeout=15,
+        follow_redirects=True,
+        trust_env=False,
+        verify=_network_ssl_context(),
+    ) as client:
         for f in feeds:
             try:
                 r = client.get(f, headers={'User-Agent': 'Mozilla/5.0'})

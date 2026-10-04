@@ -5,11 +5,22 @@ and custom employer questions truthfully using candidate profile facts and AI.
 import re
 from typing import Any
 from pydantic import BaseModel, Field
-from . import providers
+from . import profile as profiles, providers
 
 class AnswerResponse(BaseModel):
     answer: str = Field(description='The exact, concise, truthful answer to the question.')
     explanation: str = Field(default='', description='Brief explanation of the answer.')
+    evidence_ids: list[str] = Field(default_factory=list)
+    answerable: bool = False
+
+class FieldAnswer(BaseModel):
+    field_key: str
+    answer: str = ''
+    evidence_ids: list[str] = Field(default_factory=list)
+    answerable: bool = False
+
+class FieldAnswers(BaseModel):
+    answers: list[FieldAnswer] = Field(default_factory=list)
 
 def _extract_digits(text: str) -> str:
     nums = re.findall(r'\d+', text.replace(',', ''))
@@ -17,6 +28,8 @@ def _extract_digits(text: str) -> str:
 
 def resolve_contact_field(label: str, profile: dict) -> str | None:
     l = label.strip(' *').casefold()
+    if re.search(r'\b(citizenship|nationality|ethnicity|country of birth|street address|postal address)\b', l):
+        return None
     name_parts = profile.get('name', '').split()
     first_name = name_parts[0] if name_parts else ''
     last_name = name_parts[-1] if len(name_parts) > 1 else ''
@@ -48,7 +61,9 @@ def resolve_contact_field(label: str, profile: dict) -> str | None:
     if 'country' in l or 'nation' in l:
         loc = profile.get('location', '')
         return loc.split(',')[-1].strip() if ',' in loc else loc
-    if 'address' in l or 'location' in l:
+    if 'address' in l:
+        return None
+    if 'location' in l:
         return profile.get('location', '')
 
     links = profile.get('links', [])
@@ -64,8 +79,6 @@ def resolve_contact_field(label: str, profile: dict) -> str | None:
         for link in links:
             if 'github.com' not in link and 'linkedin.com' not in link:
                 return link
-        if links:
-            return links[0]
 
     return None
 
@@ -73,6 +86,11 @@ def resolve_work_auth(label: str, prefs: dict) -> str | None:
     l = label.casefold()
     work_auth = prefs.get('work_authorization', '').strip().casefold()
     if not work_auth:
+        return None
+
+    asks_us_rights = bool(re.search(r'\b(?:u\.?s\.?a?\.?|united states|america)\b', l))
+    states_us_rights = bool(re.search(r'\b(?:u\.?s\.?a?\.?|united states|america)\b', work_auth))
+    if asks_us_rights and not states_us_rights:
         return None
 
     # Check for explicit negation in profile work_auth
@@ -124,9 +142,12 @@ def resolve_experience_years(label: str, profile: dict) -> str | None:
 
     claims = re.findall(r'(\d{1,2})\+?\s*years?\s+(?:of\s+)?(?:experience\s+)?(?:building|using|with|in)\s+([^.;]{0,100})', full_text)
     technologies = ('react', 'typescript', 'javascript', 'next', 'frontend', 'html', 'css', 'redux', 'node', 'python', 'git', 'tailwind')
-    requested = next((tech for tech in technologies if tech in l), None)
+    requested = [tech for tech in technologies if re.search(rf'\b{re.escape(tech)}\b', l)]
+    if len(requested) > 1:
+        # A single year count must not be reused for a compound technologies question.
+        return None
     if requested:
-        supported = [int(years) for years, context in claims if requested in context]
+        supported = [int(years) for years, context in claims if requested[0] in context]
         return str(max(supported)) if supported else None
     stated = [int(years) for years in re.findall(r'(\d{1,2})\+?\s*years?\s+(?:of\s+)?experience', full_text)]
     return str(max(stated)) if stated else None
@@ -162,26 +183,22 @@ def resolve_salary(label: str, job: dict, prefs: dict) -> str | None:
     note_is_annual = any(k in note_lower for k in ('year', 'annual', 'annually', '/yr', 'per year'))
 
     if is_monthly:
-        if digits:
-            d_val = int(digits)
-            if note_is_monthly:
-                return str(d_val)
-            if note_is_annual or (d_val > 25000 and 'egp' not in note_lower and 'egypt' not in job_loc):
-                return str(d_val // 12)
+        if not digits:
+            return None
+        d_val = int(digits)
+        if note_is_monthly:
             return str(d_val)
-        if 'egypt' in job_loc or 'cairo' in job_loc:
-            return '65000'
-        if 'remote' in job_loc or 'worldwide' in job_loc:
-            return '5000'
-        return None
+        if note_is_annual or (d_val > 25000 and 'egp' not in note_lower and 'egypt' not in job_loc):
+            return str(d_val // 12)
+        return str(d_val)
 
     if is_hourly:
-        if digits:
-            d_val = int(digits)
-            if d_val > 2000:
-                return str(d_val // 2000)
-            return str(d_val)
-        return '40'
+        if not digits:
+            return None
+        d_val = int(digits)
+        if d_val > 2000:
+            return str(d_val // 2000)
+        return str(d_val)
 
     # Annual
     if digits:
@@ -192,14 +209,7 @@ def resolve_salary(label: str, job: dict, prefs: dict) -> str | None:
             return str(d_val * 12)
         return str(d_val)
 
-    # Market estimate based on location
-    if 'remote' in job_loc or 'us' in job_loc or 'europe' in job_loc or 'worldwide' in job_loc:
-        return '85000'
-    if 'uae' in job_loc or 'dubai' in job_loc:
-        return '180000'
-    if 'egypt' in job_loc or 'cairo' in job_loc:
-        return '750000'
-
+    # Never invent a compensation target from a location or market estimate.
     return None
 
 def resolve_notice_period(label: str, prefs: dict | None = None) -> str | None:
@@ -253,27 +263,168 @@ def match_dropdown_option(options: list[dict], target_text: str) -> str | None:
                 return opt.get('value', opt.get('label', ''))
         return None
 
-    # Number match if target is a digit
+    # Number match only when it uniquely identifies one offered option.
     digits = _extract_digits(target_text)
     if digits:
+        matches = []
         for opt in valid_opts:
             lbl = str(opt.get('label', '')).casefold()
             val = str(opt.get('value', '')).casefold()
             if re.search(rf'\b{digits}\b', lbl) or re.search(rf'\b{digits}\b', val) or f'{digits}+' in lbl or f'{digits} years' in lbl:
-                return opt.get('value', opt.get('label', ''))
+                matches.append(opt)
+        if len(matches) == 1:
+            return matches[0].get('value', matches[0].get('label', ''))
 
     # Word boundary partial match (only for words >= 3 letters to avoid false matches)
     words = [w for w in re.split(r'\W+', target_clean) if len(w) >= 3]
     if words:
+        matches = []
         for opt in valid_opts:
             lbl = str(opt.get('label', '')).casefold()
             val = str(opt.get('value', '')).casefold()
             if all(re.search(rf'\b{re.escape(w)}\b', lbl) or re.search(rf'\b{re.escape(w)}\b', val) for w in words):
-                return opt.get('value', opt.get('label', ''))
+                matches.append(opt)
+        if len(matches) == 1:
+            return matches[0].get('value', matches[0].get('label', ''))
 
     return None
 
-def answer_single_field(field: dict, profile: dict, job: dict, package: dict, prefs: dict) -> str:
+
+_DO_NOT_GUESS = (
+    r'\b(?:salary|compensation|expected pay|hourly rate|wage|remuneration|pay expectation)\b',
+    r'\b(?:authorized|authorization|eligible to work|work permit|visa|sponsorship|security clearance)\b',
+    r'\b(?:citizenship|nationality|ethnicity|race|gender|disability|medical|health condition|criminal record|background check)\b',
+    r'\b(?:consent|acknowledge|agree to|certify|attest|terms and conditions)\b',
+    r'\b(?:notice period|when can you start|availability|relocat|willing to travel|willingness to travel)\b',
+    r'\b(?:email|phone|mobile|telephone|street address|postal address)\b',
+    r'\b(?:address|current location|where do you live|where are you based|country of residence|current residence|preferred work location)\b',
+    r'\b(?:why are you interested|why do you want|what motivates|personal preference|personality)\b',
+    r'\b(?:how many years|years of experience|number of years)\b',
+)
+
+
+def can_answer_from_cv(field: dict) -> bool:
+    """Only let AI draft open-ended, CV-grounded factual answers."""
+    if field.get('type') not in ('text', 'textarea', 'select', 'radio'):
+        return False
+    question = f"{field.get('label', '')} {field.get('context', '')}".casefold()
+    return not any(re.search(pattern, question, re.I) for pattern in _DO_NOT_GUESS)
+
+
+def _exact_option(options: list[dict], answer: str) -> str | None:
+    target = answer.strip().casefold()
+    if not target:
+        return None
+    matches = [
+        option for option in options
+        if target in {
+            str(option.get('label', '')).strip().casefold(),
+            str(option.get('value', '')).strip().casefold(),
+        }
+    ]
+    if len(matches) != 1:
+        return None
+    return str(matches[0].get('value', '')).strip() or None
+
+
+def answer_open_questions(fields: list[dict], profile: dict, job: dict) -> dict[str, str]:
+    """Draft together, audit together, and return only evidence-supported answers."""
+    eligible = [field for field in fields if can_answer_from_cv(field)]
+    if not eligible:
+        return {}
+    evidence = profiles.evidence(profile)
+    if not evidence:
+        return {}
+    keys = [str(field.get('key', '')) for field in eligible]
+    if any(not key for key in keys) or len(set(keys)) != len(keys):
+        return {}
+
+    try:
+        draft = providers.ask(
+            FieldAnswers,
+            'Interpret each complete employer question, its nearby instructions, field type and offered options. '
+            'For factual questions about the candidate, write a concise answer by restating only facts directly supported by the supplied CV evidence. '
+            'Use the exact label or value for a choice question. Do not add achievements, tools, years, numbers, qualifications or experience. '
+            'Do not infer personal opinions or motivations. Set answerable=false and leave answer empty if the evidence does not answer the question or the wording is ambiguous. '
+            'Return each field_key at most once.',
+            {
+                'questions': [{
+                    'field_key': field['key'],
+                    'question': field.get('label', ''),
+                    'nearby_context': field.get('context', ''),
+                    'type': field.get('type', 'text'),
+                    'options': field.get('options', []),
+                    'max_length': field.get('max_length'),
+                } for field in eligible],
+                'job_context': {
+                    'title': job.get('title', ''),
+                    'company': job.get('company', ''),
+                    'requirements': (job.get('description') or '')[:3000],
+                },
+                'cv_evidence': evidence,
+            },
+        )
+    except Exception:
+        return {}
+
+    fields_by_key = {field['key']: field for field in eligible}
+    proposed: dict[str, dict[str, Any]] = {}
+    for answer in draft.answers:
+        key = answer.field_key
+        field = fields_by_key.get(key)
+        if not field or key in proposed or not answer.answerable:
+            continue
+        text = answer.answer.strip()
+        if not text or len(text) > min(field.get('max_length') or 2000, 2000):
+            continue
+        evidence_ids = list(dict.fromkeys(answer.evidence_ids))
+        if not evidence_ids or any(evidence_id not in evidence for evidence_id in evidence_ids):
+            continue
+        source_text = ' '.join(evidence[evidence_id] for evidence_id in evidence_ids)
+        # Keep numeric claims anchored to the exact evidence the model cited.
+        from .tailoring import guard_rewrite
+        if not guard_rewrite(source_text, text):
+            continue
+        final_value = text
+        if field.get('options'):
+            final_value = _exact_option(field['options'], text) or ''
+            if not final_value:
+                continue
+        if field.get('type') == 'number' and not re.fullmatch(r'-?\d+(?:\.\d+)?', final_value):
+            continue
+        proposed[key] = {
+            'field': field,
+            'answer': text,
+            'final_value': final_value,
+            'evidence_ids': evidence_ids,
+        }
+
+    if not proposed:
+        return {}
+    try:
+        audit = providers.ask(
+            providers.Checks,
+            'Audit each answer against the precise employer question, its nearby context and offered options. '
+            'The cv_evidence field is the ONLY evidence of candidate facts; job context and question wording are not candidate evidence. '
+            'supported=true only when the answer directly answers the question, every personal factual claim is entailed by the cited CV evidence, and any choice exactly matches one offered option. '
+            'Reject assumptions, unstated personal preferences, invented motivations, years, metrics, tools, qualifications, eligibility, compensation, availability or legal claims. Be conservative.',
+            {'entries': [{
+                'evidence_id': key,
+                'question': item['field'].get('label', ''),
+                'nearby_context': item['field'].get('context', ''),
+                'type': item['field'].get('type', 'text'),
+                'options': item['field'].get('options', []),
+                'cv_evidence': {evidence_id: evidence[evidence_id] for evidence_id in item['evidence_ids']},
+                'answer': item['answer'],
+            } for key, item in proposed.items()]},
+        ).checks
+    except Exception:
+        return {}
+
+    approved = {check.evidence_id for check in audit if check.supported}
+    return {key: item['final_value'] for key, item in proposed.items() if key in approved}
+
+def answer_single_field(field: dict, profile: dict, job: dict, package: dict, prefs: dict, *, allow_ai: bool = True) -> str:
     label = field.get('label', '')
     field_type = field.get('type', 'text')
     options = field.get('options', [])
@@ -328,35 +479,7 @@ def answer_single_field(field: dict, profile: dict, job: dict, package: dict, pr
         return package['cover_letter']
 
     # 7. AI Fallback for custom / open-ended questions
-    if any(k in label.casefold() for k in (
-        'authorized', 'authorization', 'visa', 'sponsorship', 'clearance',
-        'salary', 'compensation', 'expected pay', 'notice period',
-        'when can you start', 'years of', 'agree', 'consent', 'acknowledge',
-    )):
+    if not allow_ai or not can_answer_from_cv(field):
         return ''
-    try:
-        cfg = providers.get_provider_config()
-        if cfg.get('connected'):
-            prompt = (
-                f"You are applying to the job: {job.get('title', '')} at {job.get('company', '')}.\n"
-                f"Job description summary: {job.get('description', '')[:600]}\n\n"
-                f"Candidate name: {profile.get('name', '')}\n"
-                f"Candidate headline: {profile.get('headline', '')}\n"
-                f"Question asked on employer application: \"{label}\"\n"
-            )
-            if options:
-                opt_texts = [o.get('label', '') for o in options]
-                prompt += f"Available options to select from: {opt_texts}\n"
-                instruction = "Pick the single most truthful and appropriate option from the available options."
-            else:
-                instruction = "Provide a concise (1-3 sentences), professional, truthful answer representing the candidate."
-
-            res = providers.ask(AnswerResponse, instruction, {'prompt': prompt})
-            if options:
-                matched = match_dropdown_option(options, res.answer)
-                return matched or res.answer
-            return res.answer
-    except Exception:
-        pass
-
-    return ''
+    key = field.get('key') or label
+    return answer_open_questions([{**field, 'key': key}], profile, job).get(key, '')

@@ -105,6 +105,12 @@ export function JobCvPage() {
                 <p>{c.before}</p>
                 <h4>Tailored</h4>
                 <p>{c.after}</p>
+                {c.evidence && (
+                  <>
+                    <h4>Evidence basis</h4>
+                    <p>{c.evidence}</p>
+                  </>
+                )}
               </details>
             ))
           ) : (

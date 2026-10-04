@@ -5,7 +5,7 @@ import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,9 +48,18 @@ def init():
         CREATE TABLE IF NOT EXISTS runs (
             id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT, state TEXT NOT NULL,
             message TEXT NOT NULL, created TEXT NOT NULL, updated TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS cv_improvement_drafts (
+            id TEXT PRIMARY KEY, job_id TEXT NOT NULL, package_hash TEXT NOT NULL,
+            data TEXT NOT NULL, state TEXT NOT NULL, created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, text TEXT NOT NULL, created TEXT NOT NULL);
         ''')
+        expired_before = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        c.execute("UPDATE cv_improvement_drafts SET state='failed' WHERE state='applying'")
+        c.execute(
+            "DELETE FROM cv_improvement_drafts WHERE created < ? AND state!='applying'",
+            (expired_before,),
+        )
         c.execute("UPDATE runs SET state='interrupted',message='App restarted. Review the job before retrying.',updated=? WHERE state IN ('queued','running')", (now(),))
         c.execute("UPDATE jobs SET state='uncertain',updated=? WHERE state='submitting'", (now(),))
 
@@ -141,11 +150,24 @@ def get_package(job_id):
         r = c.execute('SELECT * FROM packages WHERE job_id=? ORDER BY created DESC LIMIT 1', (job_id,)).fetchone()
     if not r:
         return None
-    return {**json.loads(r['data']), 'id': r['id'], 'hash': r['hash'], 'approved': r['approved_hash'] == r['hash'], 'created': r['created']}
+    return _package_from_row(r)
 
-def save_package(job_id, data):
-    package_id = uid()
+def get_package_by_id(package_id):
     with db() as c:
+        r = c.execute('SELECT * FROM packages WHERE id=?', (package_id,)).fetchone()
+    return _package_from_row(r) if r else None
+
+def _package_from_row(row):
+    return {**json.loads(row['data']), 'id': row['id'], 'hash': row['hash'], 'approved': row['approved_hash'] == row['hash'], 'created': row['created']}
+
+def save_package(job_id, data, package_id=None):
+    package_id = package_id or uid()
+    with db() as c:
+        existing = c.execute('SELECT job_id FROM packages WHERE id=?', (package_id,)).fetchone()
+        if existing:
+            if existing['job_id'] != job_id:
+                raise ValueError('Package ID is already attached to a different job.')
+            return package_id
         c.execute('INSERT INTO packages VALUES (?,?,?,?,?,?)', (package_id, job_id, json.dumps(data), digest(data), None, now()))
     return package_id
 
@@ -155,3 +177,64 @@ def revise_package(package_id, data):
 
 def package_data(package):
     return {k:v for k,v in package.items() if k not in ('id','hash','approved','created')}
+
+def save_cv_improvement_draft(job_id, package_hash, data):
+    draft_id = uid()
+    created = now()
+    with db() as c:
+        c.execute("UPDATE cv_improvement_drafts SET state='superseded' WHERE job_id=? AND state='ready'", (job_id,))
+        c.execute(
+            'INSERT INTO cv_improvement_drafts VALUES (?,?,?,?,?,?)',
+            (draft_id, job_id, package_hash, json.dumps(data), 'ready', created),
+        )
+        expired_before = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        c.execute(
+            "DELETE FROM cv_improvement_drafts WHERE created < ? AND state!='applying'",
+            (expired_before,),
+        )
+    return draft_id
+
+def get_cv_improvement_draft(draft_id):
+    with db() as c:
+        row = c.execute('SELECT * FROM cv_improvement_drafts WHERE id=?', (draft_id,)).fetchone()
+    return {**dict(row), 'data': json.loads(row['data'])} if row else None
+
+def claim_cv_improvement_draft(draft_id, job_id, package_hash):
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute(
+            'SELECT id,state,package_hash,created FROM cv_improvement_drafts WHERE id=? AND job_id=?',
+            (draft_id, job_id),
+        ).fetchone()
+        if not row or row['state'] != 'ready':
+            raise ValueError('This AI draft is no longer available. Draft the changes again.')
+        expired_before = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        if row['created'] < expired_before:
+            raise ValueError('This AI draft expired. Draft the changes again.')
+        latest = c.execute(
+            'SELECT hash FROM packages WHERE job_id=? ORDER BY created DESC LIMIT 1', (job_id,)
+        ).fetchone()
+        if not latest or latest['hash'] != package_hash or row['package_hash'] != package_hash:
+            raise ValueError('The CV package changed. Reload coverage and draft changes again.')
+        active = c.execute(
+            "SELECT id FROM cv_improvement_drafts WHERE job_id=? AND state='applying'", (job_id,)
+        ).fetchone()
+        if active:
+            raise ValueError('A CV improvement is already being applied for this job.')
+        updated = c.execute(
+            "UPDATE cv_improvement_drafts SET state='applying' WHERE id=? AND state='ready'",
+            (draft_id,),
+        )
+        if updated.rowcount != 1:
+            raise ValueError('This AI draft was already used. Draft the changes again.')
+        data_row = c.execute('SELECT data FROM cv_improvement_drafts WHERE id=?', (draft_id,)).fetchone()
+    return json.loads(data_row['data'])
+
+def finish_cv_improvement_draft(draft_id, state='used'):
+    if state not in ('used', 'failed'):
+        raise ValueError('Invalid CV improvement draft state.')
+    with db() as c:
+        c.execute(
+            "UPDATE cv_improvement_drafts SET state=? WHERE id=? AND state='applying'",
+            (state, draft_id),
+        )

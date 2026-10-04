@@ -12,14 +12,14 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 
 Open http://127.0.0.1:8765 in a browser. The server binds only to loopback. First launch installs dependencies and Chromium if needed. Stop it with `powershell -ExecutionPolicy Bypass -File .\stop.ps1`.
 
-Before the first launch, place your own master CV PDF in the project root. Personal PDFs and the local `data/` directory are excluded from Git. Without a master CV, the app cannot build a profile or tailor applications. The checked-in tests that assert Walid Hamdy's imported profile require his private source PDF locally.
+Before the first launch, you can place your master CV PDF in the project root, or open **My profile** and upload one from the UI. Uploaded PDFs and the local `data/` directory are excluded from Git. Without a master CV, the app cannot build a profile or tailor applications. The checked-in tests that assert Walid Hamdy's imported profile require his private source PDF locally.
 
 ## First use
 
 1. Review **My profile**. The original two-page PDF is available from Original CV. Confirm any corrections or added evidence before saving.
 2. Save **Search preferences**, including titles and location. Defaults suggest frontend titles from the CV; geography and authorization are intentionally unconfirmed.
 3. In **Connections**, the app defaults to **100% Free Operation**:
-   - **Job Search**: Uses public feeds from Remotive, Jobicy, and Arbeitnow out of the box with zero API keys and zero cost. Brave Search is optional if you have a subscription key.
+   - **Job Search**: Free mode queries public LinkedIn Jobs and feeds from Remotive, Jobicy, Arbeitnow, and WeWorkRemotely. Serper Search can also find Google-indexed postings from Wuzzuf, Indeed, Forasna, Bayt, Tanqeeb, Naukri Gulf, GulfTalent, and Akhtaboot; those searches use Serper credits and may return snippets that need verification at the source.
    - **AI Tailoring**: Select **OpenRouter** (default) with free models such as `meta-llama/llama-3.3-70b-instruct:free`, `google/gemini-2.0-flash-exp:free`, or `openrouter/free`. OpenRouter accounts and keys are free with a $0 balance. **OpenCode** (free Zen models), local endpoints (Ollama/LMStudio), or paid **OpenAI** are also supported. Keys are stored securely in Windows Credential Manager.
 4. Use **Find jobs**, **Import a link**, or **Paste a description**. Finding jobs uses free feeds and applies your saved title, location, and posting-date criteria. Imports can initially contain only a feed summary; preparing a CV retries the full posting and asks for a pasted description when it cannot retrieve one. Greenhouse and Lever have dedicated posting adapters.
 5. Prepare a local CV, or use AI tailoring. Local mode preserves original statements and reorders skill groups completely offline without any API calls. AI mode extracts requirements, edits eligible prose, performs a second factual check, and assesses the finished CV. Employer/title/date/education/skill entries remain exact.
@@ -30,17 +30,21 @@ Before the first launch, place your own master CV PDF in the project root. Perso
 ## Local data and external services
 
 - `data/agent.sqlite3`: profile, preferences, jobs, package versions, approvals, worker runs, and history.
+- `data/master_cv_<id>.pdf`: uploaded master CV PDFs, kept locally and referenced by the saved profile.
+- `data/prepare-checkpoints.sqlite3`: local LangGraph snapshots for AI preparation runs that may need to resume after restart.
 - `data/documents/<package-id>/`: generated DOCX and PDF versions, with SHA-256 checksums.
 - `data/receipts/`: employer confirmation screenshots when available.
 - `data/server*.log`: local server diagnostics; HTTP access logging is disabled.
 - Original source PDF remains at the project root. `.gitignore` excludes all personal documents, data, credentials, and test artifacts.
-- Job search runs 100% free by querying public job feeds (Remotive, Jobicy, Arbeitnow). No CV data is sent during search.
+- Free job search uses public job sources with no API key. Serper and Brave are optional paid/search-credit web search providers. Search requests send job titles and location criteria, not CV content.
 - When AI tailoring is enabled, only CV evidence statements and job requirements are sent to the configured provider (OpenRouter, OpenCode, or OpenAI); contact details (email, phone, address) are strictly excluded from AI prompts. Provider calls use `store=False`.
 - CV generation uses python-docx. If `SOFFICE_PATH` points to a LibreOffice executable, PDF is converted from DOCX. Otherwise ReportLab generates a portable PDF from the identical structured content; pagination and type layout can differ between Word and PDF. No office suite is required for the fallback.
 
 ## Implementation boundaries
 
 One persistent queue worker runs one operation at a time. Pending work is marked interrupted after restart, and in-flight submissions become uncertain. Approvals are invalidated by package edits or master-profile changes. Document hash checks run again before download, approval and submission. Submission is claimed transactionally to prevent double clicks. Required answers, form fingerprints and a unique submit button are checked before sending. A detected confirmation is required for automatic submitted status; manually recorded results are labelled as such.
+
+AI CV preparation uses a local LangGraph workflow with per-run checkpoints and an explicit resume action after restart. Local preparation and the current review, approval, and submission gates remain separate. See [LANGGRAPH_CV_PREPARATION.md](LANGGRAPH_CV_PREPARATION.md) for the workflow, API contract, persistence behavior, and acceptance checks.
 
 The browser uses isolated temporary contexts and never your existing browser profile. Hosted forms change; unsupported forms fail closed with a manual handoff. No employer application was submitted during development. AI semantic assessments and factual audits remain fallible and need your review. The app does not automatically search on a schedule, message recruiters, infer visa eligibility, or claim interview outcomes. Salary and location uncertainties are highlighted for review rather than guessed.
 

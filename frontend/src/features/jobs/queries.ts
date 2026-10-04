@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiClient } from '../../shared/api/client'
-import type { Detail, Job } from '../../types'
+import type { CVImprovementDraft, Detail, Job } from '../../types'
 import { workspaceKeys } from '../workspace/queries'
 
 export const jobKeys = {
@@ -81,6 +81,18 @@ export function usePrepareJobMutation(jobId: string) {
   return useMutation({
     mutationFn: (params: { mode: 'ai' | 'local' }) =>
       apiClient<{ run_id: string }>(`/jobs/${jobId}/prepare`, { method: 'POST', body: params }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: workspaceKeys.bootstrap })
+      void qc.invalidateQueries({ queryKey: jobKeys.detail(jobId) })
+    },
+  })
+}
+
+export function useResumePrepareMutation(jobId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (runId: string) =>
+      apiClient<{ run_id: string }>(`/jobs/${jobId}/prepare/${runId}/resume`, { method: 'POST', body: {} }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: workspaceKeys.bootstrap })
       void qc.invalidateQueries({ queryKey: jobKeys.detail(jobId) })
@@ -181,6 +193,43 @@ export function useAutoApplyJobMutation(jobId: string) {
   return useMutation({
     mutationFn: (params: { package_hash?: string; auto_submit: boolean; headless?: boolean }) =>
       apiClient<{ run_id: string }>(`/jobs/${jobId}/auto-apply`, { method: 'POST', body: params }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: workspaceKeys.bootstrap })
+      void qc.invalidateQueries({ queryKey: jobKeys.detail(jobId) })
+    },
+  })
+}
+
+export function useDraftCoverageImprovementsMutation(jobId: string) {
+  return useMutation({
+    mutationFn: (payload: {
+      package_hash: string
+      selections: { requirement_index: number; evidence_text: string; evidence_confirmed: boolean }[]
+    }) => apiClient<CVImprovementDraft>(`/jobs/${jobId}/coverage/improvements/draft`, {
+      method: 'POST', body: payload,
+    }),
+  })
+}
+
+export function useApplyCoverageImprovementsMutation(jobId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: { package_hash: string; draft_id: string; suggestion_ids: string[] }) =>
+      apiClient<{ ok: boolean; package_id: string; score: number; change_count: number }>(
+        `/jobs/${jobId}/coverage/improvements/apply`, { method: 'POST', body: payload }
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: workspaceKeys.bootstrap })
+      void qc.invalidateQueries({ queryKey: jobKeys.detail(jobId) })
+    },
+  })
+}
+
+export function useContinueAutoApplyMutation(jobId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      apiClient<{ ok: boolean; run_id: string; message: string }>(`/jobs/${jobId}/auto-apply/continue`, { method: 'POST' }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: workspaceKeys.bootstrap })
       void qc.invalidateQueries({ queryKey: jobKeys.detail(jobId) })

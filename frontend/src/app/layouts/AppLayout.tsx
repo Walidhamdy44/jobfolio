@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef, Fragment } from 'react'
-import { Outlet, NavLink, useLocation, Link } from 'react-router-dom'
+import { useCallback, useState, useEffect, useRef, Fragment } from 'react'
+import { Outlet, NavLink, useLocation, useNavigate, Link } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
 import {
-  BriefcaseBusiness,
   ChevronRight,
   ShieldCheck,
   RefreshCw,
@@ -11,16 +11,29 @@ import {
 } from 'lucide-react'
 import { MAIN_NAV } from '../navigation'
 import { useBootstrapQuery } from '../../features/workspace/queries'
+import { PrepareRunHandoff } from '../../features/jobs/PrepareRunHandoff'
+import { AutoApplyContinueButton } from '../../features/jobs/AutoApplyContinueButton'
+import { useContinueAutoApplyMutation } from '../../features/jobs/queries'
+import type { Run } from '../../types'
 import { Notice } from '../../shared/ui/Notice'
+import { BrandLogo } from '../../shared/ui/BrandLogo'
 
 export function AppLayout() {
   const location = useLocation()
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useBootstrapQuery()
 
   const [dismissedRun, setDismissedRun] = useState<string>('')
   const [toast, setToast] = useState<string>('')
   const [isManualRefreshing, setIsManualRefreshing] = useState(false)
+  const [pendingPrepareHandoff, setPendingPrepareHandoff] = useState<{ jobId: string; runId: string } | null>(null)
   const notifiedInput = useRef('')
+
+  const trackPrepareRun = useCallback((jobId: string, runId: string) => {
+    setPendingPrepareHandoff({ jobId, runId })
+  }, [])
+  const clearPrepareHandoff = useCallback(() => setPendingPrepareHandoff(null), [])
 
   const handleManualRefresh = async () => {
     setIsManualRefreshing(true)
@@ -31,18 +44,36 @@ export function AppLayout() {
     }
   }
 
+  const activeRuns = data?.runs.filter((r) => ['queued', 'running'].includes(r.state)) || []
+  const activeRun = activeRuns[0]
+  const waitingRun = activeRun?.kind === 'auto_apply' && activeRun.message?.startsWith('Input needed:')
+    ? activeRun as Run
+    : undefined
+  const inputNeededJob = data?.jobs.find((job) =>
+    job.input_request && !['submitted', 'skipped'].includes(job.state)
+  )
+  const autoApplyInputJob = data?.jobs.find((job) =>
+    job.id === waitingRun?.target && job.state === 'needs_input' && job.input_request
+  )
+  const waitingForInput = Boolean(waitingRun && autoApplyInputJob)
+  const continueAutoApplyMutation = useContinueAutoApplyMutation(autoApplyInputJob?.id || '')
+
+  const handleContinueAutoApply = async () => {
+    if (!autoApplyInputJob) return
+    try {
+      const result = await continueAutoApplyMutation.mutateAsync()
+      setToast(result.message)
+    } catch (e) {
+      setToast((e as Error).message)
+    }
+  }
+
   useEffect(() => {
     if (toast) {
       const t = setTimeout(() => setToast(''), 5000)
       return () => clearTimeout(t)
     }
   }, [toast])
-
-  const activeRuns = data?.runs.filter((r) => ['queued', 'running'].includes(r.state)) || []
-  const waitingForInput = activeRuns[0]?.kind === 'auto_apply' && activeRuns[0]?.message?.startsWith('Input needed:')
-  const inputNeededJob = data?.jobs.find((job) =>
-    job.input_request && !['submitted', 'skipped'].includes(job.state)
-  )
 
   useEffect(() => {
     if (!inputNeededJob?.input_request) return
@@ -78,7 +109,7 @@ export function AppLayout() {
   if (isLoading && !data) {
     return (
       <main className="loading-page">
-        <BriefcaseBusiness size={30} aria-hidden="true" />
+        <BrandLogo loading />
         <h1>Opening your workspace</h1>
         <p>Loading your profile and saved jobs…</p>
       </main>
@@ -94,10 +125,7 @@ export function AppLayout() {
       {/* Sidebar Navigation */}
       <aside className="sidebar" aria-label="Main sidebar">
         <Link to="/opportunities" className="brand">
-          <span className="brand-mark" aria-hidden="true">
-            <BriefcaseBusiness size={22} />
-          </span>
-          jobfolio<span className="brand-dot">.</span>
+          <BrandLogo />
         </Link>
 
         <div className="workspace-switch">
@@ -292,11 +320,28 @@ export function AppLayout() {
                   <p className="run-step-text">{activeRuns[0].message || 'Agent active…'}</p>
                 </div>
                 <span className="run-banner-aside">{waitingForInput ? 'Input required' : 'Background operation'}</span>
+                <AutoApplyContinueButton
+                  job={autoApplyInputJob}
+                  run={waitingRun}
+                  isPending={continueAutoApplyMutation.isPending}
+                  onContinue={() => void handleContinueAutoApply()}
+                />
               </div>
             </div>
           )}
 
-          <Outlet context={{ data, setToast }} />
+          <PrepareRunHandoff
+            jobId={pendingPrepareHandoff?.jobId || ''}
+            pendingRunId={pendingPrepareHandoff?.runId || null}
+            runState={data?.runs.find((run) => run.id === pendingPrepareHandoff?.runId)?.state}
+            onClear={clearPrepareHandoff}
+            navigate={navigate}
+            locationPath={location.pathname}
+            refreshJob={() => queryClient.invalidateQueries({
+              queryKey: ['jobs', 'detail', pendingPrepareHandoff?.jobId || ''],
+            })}
+          />
+          <Outlet context={{ data, setToast, trackPrepareRun }} />
         </main>
 
         <footer className="footer">

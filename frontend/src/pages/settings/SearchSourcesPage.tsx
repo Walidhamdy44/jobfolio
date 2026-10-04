@@ -66,6 +66,12 @@ export function SearchSourcesPage() {
   }
 
   const isBusy = saveSettingsMutation.isPending || searchMutation.isPending
+  const searchStatus = searchProvider === 'free'
+    ? 'Free feeds selected'
+    : searchProvider === 'serper'
+    ? connections?.serper ? 'Serper key saved · unverified' : 'Serper key required'
+    : connections?.brave ? 'Brave key saved · unverified' : 'Brave key required'
+  const searchReady = searchProvider === 'free'
 
   return (
     <form className="settings-form" onSubmit={handleSave}>
@@ -75,17 +81,7 @@ export function SearchSourcesPage() {
             <Search size={23} />
             <h2>Job Search Provider</h2>
           </div>
-          <span className="tag connected">
-            {searchProvider === 'free'
-              ? 'LinkedIn & Feeds Active'
-              : searchProvider === 'serper'
-              ? connections?.serper
-                ? 'Google Jobs Connected'
-                : 'Serper Key Required'
-              : connections?.brave
-              ? 'Brave Connected'
-              : 'Brave Not Configured'}
-          </span>
+          <span className={`tag ${searchReady ? 'connected' : ''}`}>{searchStatus}</span>
         </div>
         <p>Choose how the agent finds new opportunities based on your saved titles and location.</p>
 
@@ -107,7 +103,7 @@ export function SearchSourcesPage() {
                 LinkedIn & Free Feeds <span className="free-badge">100% Free</span>
               </strong>
               <small>
-                Direct LinkedIn Jobs (Egypt, worldwide, and remote), plus WeWorkRemotely, Remotive, Jobicy, and Arbeitnow. Zero API keys required.
+                Free LinkedIn and remote feeds. Wuzzuf, Indeed, Forasna, Bayt, Tanqeeb, and Gulf job boards are available with Serper Search.
               </small>
             </div>
 
@@ -120,9 +116,9 @@ export function SearchSourcesPage() {
                 if (e.key === 'Enter' || e.key === ' ') setSearchProvider('serper')
               }}
             >
-              <strong>Google Jobs (Serper API)</strong>
+              <strong>Job search via Serper</strong>
               <small>
-                Aggregates Google Jobs across LinkedIn, Indeed, Glassdoor, ZipRecruiter, and employer career sites. 2,500 free searches.
+                Searches Google-indexed listings from Wuzzuf, Indeed, Forasna, Bayt, Tanqeeb, Naukri Gulf, GulfTalent, and Akhtaboot. Uses Serper credits; verify details on the source site.
               </small>
             </div>
 
@@ -144,15 +140,15 @@ export function SearchSourcesPage() {
         {searchProvider === 'serper' && (
           <>
             <Field
-              label="Serper Google Jobs API key"
-              hint="Sends search terms and location to Google Jobs. Free accounts include 2,500 queries."
+              label="Serper.dev API key"
+              hint="Serper.dev keys only; SerpApi.com keys are separate. Searches send saved job titles and location, not your CV."
             >
               <input
                 type="password"
                 autoComplete="new-password"
                 value={serperKey}
                 onChange={(e) => setSerperKey(e.target.value)}
-                placeholder={connections?.serper ? '•••••••••••••••• (Connected)' : 'Enter your Serper API key'}
+                placeholder={connections?.serper ? 'Saved; enter a replacement key to change it' : 'Enter your Serper.dev API key'}
               />
             </Field>
             <a
@@ -161,7 +157,7 @@ export function SearchSourcesPage() {
               target="_blank"
               rel="noreferrer"
             >
-              Get a free Serper API key (2,500 free searches)
+              Get a Serper.dev API key (2,500 free searches)
               <ArrowUpRight size={14} />
             </a>
           </>

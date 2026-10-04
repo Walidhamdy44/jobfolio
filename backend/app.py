@@ -6,11 +6,11 @@ from typing import Literal
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, ConfigDict
-from . import store, profile, providers, network, tailoring, search, browser, worker
+from . import store, profile, providers, network, tailoring, search, browser, worker, prepare_graph, cv_improvements
 from .documents import verify_files
 
 load_dotenv(store.ROOT/'.env')
@@ -52,7 +52,8 @@ async def generic_error(request,exc): return JSONResponse({'detail':worker.error
 def busy(job_id):
     with store.db() as c:
         active=c.execute("SELECT id FROM runs WHERE target=? AND state IN ('queued','running')",(job_id,)).fetchone()
-    if active: raise ValueError('An operation for this job is still running. Wait for it to finish.')
+        applying=c.execute("SELECT id FROM cv_improvement_drafts WHERE job_id=? AND state='applying'",(job_id,)).fetchone()
+    if active or applying: raise ValueError('An operation for this job is still running. Wait for it to finish.')
     if store.get_job(job_id)['state'] in ('submitted','submitting','uncertain'):
         raise ValueError('This application is submitted or uncertain. Resolve its status before changing it.')
 
@@ -109,12 +110,14 @@ class ProfileInput(Strict):
     location:str=Field(max_length=250)
     links:list[str]=Field(max_length=15)
     sections:list[Section]=Field(min_length=1,max_length=20)
+    source_file:str|None=Field(default=None,max_length=200)
 
 class StructureProfileInput(Strict):
     mode: Literal['ai', 'local'] = 'ai'
+    source_file:str|None=Field(default=None,max_length=200)
 
 class SettingsInput(Strict):
-    provider: Literal['openrouter', 'tokenrouter', 'opencode', 'openai', 'custom'] = 'openrouter'
+    provider: Literal['openrouter', 'tokenrouter', 'opencode', 'openai', 'codecraft', 'custom'] = 'openrouter'
     api_key: str|None = Field(default=None, max_length=1000)
     openai_key: str|None = Field(default=None, max_length=1000)
     brave_key: str|None = Field(default=None, max_length=1000)
@@ -133,6 +136,20 @@ class ReviewInput(Strict):
     coverage_reviewed:bool
     answers:dict[str,str]
     supports:list[Literal['full','partial','missing']]
+
+class CoverageImprovementSelection(Strict):
+    requirement_index:int=Field(ge=0,le=59)
+    evidence_text:str=Field(default='',max_length=2000)
+    evidence_confirmed:bool=False
+
+class DraftCoverageImprovementsInput(Strict):
+    package_hash:str=Field(min_length=1,max_length=64)
+    selections:list[CoverageImprovementSelection]=Field(min_length=1,max_length=30)
+
+class ApplyCoverageImprovementsInput(Strict):
+    package_hash:str=Field(min_length=1,max_length=64)
+    draft_id:str=Field(min_length=1,max_length=64)
+    suggestion_ids:list[str]=Field(min_length=1,max_length=30)
 
 class HashInput(Strict):
     package_hash:str
@@ -177,6 +194,7 @@ def bootstrap():
             'openrouter': bool(providers.secret('OPENROUTER_API_KEY')),
             'tokenrouter': bool(providers.secret('TOKENROUTER_API_KEY')),
             'opencode': bool(providers.secret('OPENCODE_API_KEY')),
+            'codecraft': bool(providers.secret('CODECRAFT_API_KEY')),
         }
     }
 
@@ -190,24 +208,59 @@ def save_profile(body:ProfileInput):
     old=store.setting('profile',{})
     data=body.model_dump(); ids=[i['id'] for s in data['sections'] for i in s['items']]
     if len(ids)!=len(set(ids)): raise ValueError('Profile evidence identifiers must be unique.')
-    data.update(revision=old.get('revision',0)+1,source_file=old.get('source_file',''))
+    source_file = body.source_file or old.get('source_file','')
+    if source_file and source_file != old.get('source_file','') and not profile.master_pdf_path(source_file):
+        raise ValueError('The uploaded master CV could not be found. Upload it again before saving.')
+    data.update(revision=old.get('revision',0)+1,source_file=source_file)
     store.set_setting('profile',data)
     with store.db() as c:
         c.execute('UPDATE packages SET approved_hash=NULL')
         c.execute("UPDATE jobs SET state='awaiting_review' WHERE state='approved'")
-    return {'ok':True}
+    return {'ok':True,'profile':data}
+
+@app.post('/api/profile/master-cv')
+async def upload_master_cv(request:Request):
+    content_type = request.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+    if content_type != 'application/pdf':
+        raise ValueError('Upload a PDF file.')
+    max_bytes = 15 * 1024 * 1024
+    content_length = request.headers.get('content-length')
+    if content_length:
+        try:
+            content_length_value = int(content_length)
+        except ValueError as exc:
+            raise ValueError('Invalid upload size.') from exc
+        if content_length_value > max_bytes:
+            raise HTTPException(413, 'The CV PDF must be 15 MB or smaller.')
+    uploaded = bytearray()
+    async for chunk in request.stream():
+        uploaded.extend(chunk)
+        if len(uploaded) > max_bytes:
+            raise HTTPException(413, 'The CV PDF must be 15 MB or smaller.')
+    pdf_bytes = bytes(uploaded)
+    if not pdf_bytes.startswith(b'%PDF-'):
+        raise ValueError('The uploaded file is not a valid PDF.')
+    with store.db() as c:
+        if c.execute("SELECT id FROM runs WHERE state IN ('queued','running')").fetchone():
+            raise ValueError('Wait for current operations before replacing your master CV.')
+    old = store.setting('profile', {}) or {}
+    source_file = f'master_cv_{store.uid()}.pdf'
+    candidate = profile.profile_from_pdf_bytes(pdf_bytes, source_file, old.get('revision', 0))
+    store.DATA.mkdir(parents=True, exist_ok=True)
+    (store.DATA / source_file).write_bytes(pdf_bytes)
+    return {'profile':candidate,'ok':True}
 
 @app.post('/api/profile/structure')
 def structure_profile(body:StructureProfileInput=StructureProfileInput()):
-    res=profile.structure_cv(mode=body.mode)
+    res=profile.structure_cv(mode=body.mode, source_file=body.source_file)
     return {'profile':res,'ok':True}
 
 @app.get('/api/master-cv')
 def master_cv():
     name=store.setting('profile',{}).get('source_file','')
-    path=(store.ROOT/name).resolve()
-    if not name or path.parent!=store.ROOT or not path.is_file(): raise HTTPException(404,'Master CV not found.')
-    return FileResponse(path,media_type='application/pdf',filename=name)
+    path=profile.master_pdf_path(name)
+    if not path: raise HTTPException(404,'Master CV not found.')
+    return FileResponse(path,media_type='application/pdf',filename=path.name)
 
 @app.put('/api/preferences')
 def save_preferences(body:Preferences):
@@ -320,11 +373,23 @@ def run_search(body: SearchInput = SearchInput()):
         raise ValueError('Review and save your search preferences first.')
     return {'run_id':worker.enqueue('search',None,lambda progress=None:search.search_jobs(progress=progress))}
 
+@app.get('/api/search/company-logo')
+def search_company_logo(url: str):
+    from .logos import fetch_company_logo
+
+    logo = fetch_company_logo(url)
+    if not logo:
+        raise HTTPException(404, 'Company logo is unavailable.')
+    content_type, content = logo
+    return Response(content=content, media_type=content_type, headers={'Cache-Control': 'public, max-age=86400'})
+
+
 @app.get('/api/jobs/{job_id}')
 def job_detail(job_id:str):
     job=store.get_job(job_id)
     with store.db() as c: events=[dict(r) for r in c.execute('SELECT * FROM events WHERE job_id=? ORDER BY id DESC',(job_id,))]
-    return {'job':job,'package':store.get_package(job_id),'events':events}
+    return {'job':job,'package':store.get_package(job_id),'events':events,
+            'resumable_prepare_run':prepare_graph.resumable_run(job_id)}
 
 @app.patch('/api/jobs/{job_id}')
 def update_job_details(job_id:str, body:JobUpdateInput):
@@ -396,7 +461,33 @@ def prepare_job(job_id:str,body:PrepareInput):
             raise ValueError(f'Connect an API key for {p_name} in Settings first, or use local preparation.')
         if cfg['provider'] == 'openrouter':
             providers.validate_openrouter_key(cfg['key'])
-    return {'run_id':worker.enqueue('prepare',job_id,lambda progress=None:tailoring.prepare(job_id,body.mode,progress=progress))}
+        run_id = store.uid()
+        queued_id = worker.enqueue(
+            'prepare', job_id,
+            lambda progress=None:tailoring.prepare(job_id, 'ai', progress=progress, run_id=run_id),
+            run_id=run_id,
+        )
+        return {'run_id':queued_id}
+    run_id = worker.enqueue('prepare',job_id,lambda progress=None:tailoring.prepare(job_id,body.mode,progress=progress))
+    return {'run_id':run_id}
+
+@app.post('/api/jobs/{job_id}/prepare/{run_id}/resume')
+def resume_prepare_job(job_id:str,run_id:str):
+    busy(job_id)
+    resumable = prepare_graph.resumable_run(job_id)
+    if not resumable or resumable['id'] != run_id:
+        raise HTTPException(409,'This preparation is no longer resumable. Start a fresh AI preparation.')
+    cfg = providers.get_provider_config()
+    if not cfg['connected']:
+        p_name = providers.PROVIDER_DISPLAY_NAMES.get(cfg['provider'], cfg['provider'].capitalize())
+        raise ValueError(f'Connect an API key for {p_name} in Settings first, or start a local preparation.')
+    if cfg['provider'] == 'openrouter':
+        providers.validate_openrouter_key(cfg['key'])
+    queued_id = worker.resume(
+        run_id,
+        lambda progress=None:prepare_graph.resume_ai_preparation(run_id, progress=progress),
+    )
+    return {'run_id':queued_id}
 
 @app.post('/api/jobs/{job_id}/inspect')
 def inspect_form(job_id:str):
@@ -425,6 +516,30 @@ def review_job(job_id:str,body:ReviewInput):
     data.update(score=tailoring.score(data['requirements']),cv_reviewed=body.cv_reviewed,coverage_reviewed=body.coverage_reviewed,answers=body.answers)
     store.revise_package(package['id'],data); store.update_job(job_id,state='awaiting_review',score=data['score'])
     return {'ok':True}
+
+@app.post('/api/jobs/{job_id}/coverage/improvements/draft')
+def draft_coverage_improvements(job_id:str,body:DraftCoverageImprovementsInput):
+    busy(job_id)
+    cfg=providers.get_provider_config()
+    if not cfg['connected']:
+        p_name=providers.PROVIDER_DISPLAY_NAMES.get(cfg['provider'],cfg['provider'].capitalize())
+        raise ValueError(f'Connect an API key for {p_name} in Connections to draft CV improvements.')
+    if cfg['provider']=='openrouter':
+        providers.validate_openrouter_key(cfg['key'])
+    data=cv_improvements.draft(
+        job_id, body.package_hash,
+        [selection.model_dump() for selection in body.selections],
+    )
+    draft_id=store.save_cv_improvement_draft(job_id,body.package_hash,data)
+    return {'draft_id':draft_id,**data}
+
+@app.post('/api/jobs/{job_id}/coverage/improvements/apply')
+def apply_coverage_improvements(job_id:str,body:ApplyCoverageImprovementsInput):
+    busy(job_id)
+    result=cv_improvements.apply(
+        job_id,body.package_hash,body.draft_id,body.suggestion_ids,
+    )
+    return {'ok':True,**result}
 
 @app.post('/api/jobs/{job_id}/approve')
 def approve(job_id:str,body:HashInput):
@@ -481,6 +596,26 @@ def auto_apply(job_id: str, body: AutoApplyInput = AutoApplyInput()):
             )
         )
     }
+
+
+@app.post('/api/jobs/{job_id}/auto-apply/continue')
+def continue_auto_apply(job_id: str):
+    job = store.get_job(job_id)
+    if job['state'] != 'needs_input' or not job.get('input_request'):
+        raise HTTPException(409, 'Auto-Apply is not waiting for input on this job.')
+    with store.db() as c:
+        active = c.execute(
+            "SELECT id FROM runs WHERE kind='auto_apply' AND target=? AND state='running'",
+            (job_id,),
+        ).fetchone()
+    if not active:
+        raise HTTPException(409, 'The Auto-Apply browser session is no longer active. Start Co-Pilot again to continue.')
+    try:
+        browser.request_auto_apply_continue(job_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {'ok': True, 'run_id': active['id'], 'message': 'Auto-Apply is continuing in the open browser.'}
+
 
 @app.post('/api/browser/open-session')
 def open_session(body: OpenSessionInput = OpenSessionInput()):

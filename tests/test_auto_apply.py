@@ -1,7 +1,8 @@
 import pytest
+import time
 from unittest.mock import MagicMock
 from playwright.sync_api import sync_playwright
-from backend import store, form_engine, browser
+from backend import store, form_engine, browser, worker
 
 def test_form_engine_contact_resolution():
     mock_profile = {
@@ -143,19 +144,46 @@ def test_contact_field_country_code_disambiguation():
     ) == 'eg'
 
 
-def test_copilot_keeps_browser_open_for_missing_input(client, job):
+def test_copilot_continue_button_resumes_the_waiting_run(client, job):
     page = MagicMock()
     page.is_closed.return_value = False
-    progress = []
     message = 'Complete expected salary in the employer form.'
 
-    result = browser._handoff_to_user(page, job['id'], message, progress.append)
+    run_id = worker.enqueue(
+        'auto_apply',
+        job['id'],
+        lambda report: browser._handoff_to_user(page, job['id'], message, report),
+    )
 
-    assert result == message
-    assert store.get_job(job['id'])['state'] == 'needs_input'
+    deadline = time.monotonic() + 3
+    while store.get_job(job['id'])['state'] != 'needs_input' and time.monotonic() < deadline:
+        time.sleep(0.01)
+
     assert store.get_job(job['id'])['input_request'] == message
-    assert progress == [f'Input needed: {message}']
-    page.wait_for_event.assert_called_once_with('close', timeout=0)
+    response = client.post(f'/api/jobs/{job["id"]}/auto-apply/continue')
+
+    assert response.status_code == 200
+    assert response.json()['run_id'] == run_id
+    deadline = time.monotonic() + 3
+    with store.db() as c:
+        run = c.execute('SELECT state FROM runs WHERE id=?', (run_id,)).fetchone()
+    while run['state'] == 'running' and time.monotonic() < deadline:
+        time.sleep(0.01)
+        with store.db() as c:
+            run = c.execute('SELECT state FROM runs WHERE id=?', (run_id,)).fetchone()
+
+    assert run['state'] == 'completed'
+    assert store.get_job(job['id'])['state'] == 'submitting'
+    assert store.get_job(job['id'])['input_request'] is None
+
+
+def test_copilot_continue_rejects_stale_input_requests(client, job):
+    store.update_job(job['id'], state='needs_input', input_request='Complete expected salary.')
+
+    response = client.post(f'/api/jobs/{job["id"]}/auto-apply/continue')
+
+    assert response.status_code == 409
+    assert 'no longer active' in response.json()['detail']
 
 
 def test_copilot_fills_known_contact_and_flags_unknown_required_field(client, job):

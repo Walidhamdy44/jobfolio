@@ -37,6 +37,7 @@ DEFAULT_MODELS = {
     'tokenrouter': 'z-ai/glm-5.3-free',
     'opencode': 'muse-spark-1.3-contributor-free',
     'openai': 'gpt-4o-mini',
+    'codecraft': 'gpt-5.6-luna',
     'custom': 'minimax/minimax-m3:free',
 }
 
@@ -45,6 +46,7 @@ DEFAULT_BASE_URLS = {
     'tokenrouter': 'https://api.tokenrouter.io/v1',
     'opencode': 'https://opencode.ai/zen/v1',
     'openai': 'https://api.openai.com/v1',
+    'codecraft': 'https://codecraftapi.com/v1',
     'custom': 'http://localhost:11434/v1',
 }
 
@@ -53,6 +55,7 @@ PROVIDER_SECRET_NAMES = {
     'tokenrouter': 'TOKENROUTER_API_KEY',
     'opencode': 'OPENCODE_API_KEY',
     'openai': 'OPENAI_API_KEY',
+    'codecraft': 'CODECRAFT_API_KEY',
     'custom': 'CUSTOM_API_KEY',
 }
 
@@ -61,6 +64,7 @@ PROVIDER_DISPLAY_NAMES = {
     'tokenrouter': 'TokenRouter',
     'opencode': 'OpenCode',
     'openai': 'OpenAI',
+    'codecraft': 'CodeCraft',
     'custom': 'Custom',
 }
 
@@ -134,6 +138,15 @@ class Rewrite(BaseModel):
 
 class Rewrites(BaseModel):
     changes: list[Rewrite]
+
+class CVImprovement(BaseModel):
+    requirement_indices: list[int]
+    action: Literal['rewrite', 'add']
+    evidence_id: str
+    text: str
+
+class CVImprovements(BaseModel):
+    changes: list[CVImprovement]
 
 class Check(BaseModel):
     evidence_id: str
@@ -268,6 +281,16 @@ def _ask_opencode(schema, instruction, payload, cfg):
     except subprocess.TimeoutExpired as exc:
         raise ValueError('OpenCode timed out. Check its status and retry, or use local CV preparation.') from exc
 
+def _provider_http_client(provider):
+    if provider != 'codecraft':
+        return None
+    import ssl
+    import truststore
+    return httpx.Client(
+        verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+        timeout=90,
+    )
+
 def ask(schema, instruction, payload):
     from openai import OpenAI
     import openai
@@ -292,13 +315,18 @@ def ask(schema, instruction, payload):
             'X-Title': 'Jobfolio Local Agent',
         }
 
-    client = OpenAI(
-        api_key=key or 'not-needed-for-local',
-        base_url=base_url,
-        default_headers=default_headers,
-        timeout=90,
-        max_retries=1
-    )
+    codecraft_http_client = _provider_http_client(provider)
+
+    client_options = {
+        'api_key': key or 'not-needed-for-local',
+        'base_url': base_url,
+        'default_headers': default_headers,
+        'timeout': 90,
+        'max_retries': 1,
+    }
+    if codecraft_http_client is not None:
+        client_options['http_client'] = codecraft_http_client
+    client = OpenAI(**client_options)
 
     schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
     system_prompt = (
@@ -394,3 +422,6 @@ def ask(schema, instruction, payload):
         if '429' in msg or 'rate limit' in msg.lower() or 'quota' in msg.lower():
             raise ValueError('Free model quota or rate limit reached. Please wait a moment, switch to another free model in Connections, or use local preparation.') from e
         raise ValueError(f'AI tailoring failed: {msg}') from e
+    finally:
+        if codecraft_http_client is not None:
+            codecraft_http_client.close()

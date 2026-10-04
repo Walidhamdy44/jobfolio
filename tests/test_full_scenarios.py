@@ -312,6 +312,18 @@ def test_scenario_10_profile_cv_structuring(client):
             providers.StructuredSection(
                 title='Professional Experience',
                 items=['Front-End Developer at Tech Corp (2022 - Present): Led migration to Next.js reducing bundle size by 35%.']
+            ),
+            providers.StructuredSection(
+                title='Selected Projects',
+                items=['Commerce platform: Built a responsive Next.js storefront.']
+            ),
+            providers.StructuredSection(
+                title='Education and Certifications',
+                items=['Bachelor of Science in Computer Science.']
+            ),
+            providers.StructuredSection(
+                title='Languages',
+                items=['Arabic: Native | English: Advanced']
             )
         ]
     )
@@ -325,7 +337,7 @@ def test_scenario_10_profile_cv_structuring(client):
             assert data_ai['ok'] is True
             prof_ai = data_ai['profile']
             assert prof_ai['name'] == 'Walid Hamdy'
-            assert len(prof_ai['sections']) == 3
+            assert len(prof_ai['sections']) == 6
             assert prof_ai['sections'][0]['title'] == 'Summary'
             assert 'bundle size' in prof_ai['sections'][2]['items'][0]['text']
 
@@ -341,5 +353,5 @@ def test_scenario_10_profile_cv_structuring(client):
             }
             res_save = client.put('/api/profile', json=save_payload)
             assert res_save.status_code == 200
-            updated = client.get('/api/bootstrap').json()['profile']
+            updated = client.get('/api/workspace').json()['profile']
             assert updated['headline'] == 'Senior Frontend Engineer | React & AI'

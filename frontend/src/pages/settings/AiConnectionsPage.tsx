@@ -156,6 +156,22 @@ export function AiConnectionsPage() {
             </div>
 
             <div
+              className={`provider-card ${provider === 'codecraft' ? 'selected' : ''}`}
+              onClick={() => {
+                setProvider('codecraft')
+                setModel('gpt-5.6-luna')
+              }}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') setProvider('codecraft')
+              }}
+            >
+              <strong>CodeCraft</strong>
+              <small>CodeCraft API — OpenAI-compatible (GPT-5.6 Luna).</small>
+            </div>
+
+            <div
               className={`provider-card ${provider === 'openai' ? 'selected' : ''}`}
               onClick={() => {
                 setProvider('openai')
@@ -248,6 +264,24 @@ export function AiConnectionsPage() {
           </div>
         )}
 
+        {provider === 'codecraft' && (
+          <div className="field">
+            <span>CodeCraft models</span>
+            <div className="model-pills" role="radiogroup" aria-label="CodeCraft models">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={model === 'gpt-5.6-luna'}
+                className={`model-pill ${model === 'gpt-5.6-luna' ? 'active' : ''}`}
+                onClick={() => setModel('gpt-5.6-luna')}
+              >
+                GPT-5.6 Luna
+              </button>
+            </div>
+            <small>OpenAI-compatible via https://codecraftapi.com/v1 — save a CodeCraft API key (cc_...).</small>
+          </div>
+        )}
+
         <Field label="Model identifier" hint="Enter any model name supported by your selected provider." required>
           <input
             value={model}
@@ -281,6 +315,8 @@ export function AiConnectionsPage() {
                     ? 'TokenRouter'
                     : provider === 'opencode'
                     ? 'OpenCode'
+                    : provider === 'codecraft'
+                    ? 'CodeCraft'
                     : 'OpenAI'
                 } API key`
           }
@@ -314,6 +350,17 @@ export function AiConnectionsPage() {
             rel="noreferrer"
           >
             Manage TokenRouter API keys (tokenrouter.io)
+            <ArrowUpRight size={14} />
+          </a>
+        )}
+        {provider === 'codecraft' && (
+          <a
+            className="text-button"
+            href="https://codecraftapi.com/dashboard"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Manage CodeCraft API keys (codecraftapi.com/dashboard)
             <ArrowUpRight size={14} />
           </a>
         )}

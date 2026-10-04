@@ -8,7 +8,8 @@ import {
   ChevronRight,
   Download,
 } from 'lucide-react'
-import { useJobDetailQuery, usePrepareJobMutation, useCoverLetterMutation } from '../../features/jobs/queries'
+import { useJobDetailQuery, usePrepareJobMutation, useResumePrepareMutation, useCoverLetterMutation } from '../../features/jobs/queries'
+import { ResumePreparationButton } from '../../features/jobs/PrepareRunHandoff'
 import { ReviewDraftProvider } from '../../features/review/ReviewDraftContext'
 import { Badge } from '../../shared/ui/Badge'
 import { Button } from '../../shared/ui/Button'
@@ -18,14 +19,16 @@ import type { Bootstrap } from '../../types'
 
 export function JobLayout() {
   const { jobId } = useParams<{ jobId: string }>()
-  const { data: bootstrap, setToast } = useOutletContext<{
+  const { data: bootstrap, setToast, trackPrepareRun } = useOutletContext<{
     data?: Bootstrap
     setToast: (msg: string) => void
+    trackPrepareRun: (jobId: string, runId: string) => void
   }>()
 
   const { data: detail, isLoading, error } = useJobDetailQuery(jobId)
 
   const prepareMutation = usePrepareJobMutation(jobId || '')
+  const resumePrepareMutation = useResumePrepareMutation(jobId || '')
   const coverLetterMutation = useCoverLetterMutation(jobId || '')
 
   if (isLoading) {
@@ -60,8 +63,19 @@ export function JobLayout() {
 
   const handlePrepare = async (mode: 'ai' | 'local') => {
     try {
-      await prepareMutation.mutateAsync({ mode })
+      const result = await prepareMutation.mutateAsync({ mode })
+      if (mode === 'ai') trackPrepareRun(job.id, result.run_id)
       setToast(mode === 'ai' ? 'AI CV tailoring started.' : 'Local CV preparation started.')
+    } catch (e) {
+      setToast((e as Error).message)
+    }
+  }
+
+  const handleResumePrepare = async (runId: string) => {
+    try {
+      const result = await resumePrepareMutation.mutateAsync(runId)
+      trackPrepareRun(job.id, result.run_id)
+      setToast('AI CV preparation resumed.')
     } catch (e) {
       setToast((e as Error).message)
     }
@@ -130,6 +144,11 @@ export function JobLayout() {
                 <Sparkles size={15} />
                 Tailor with AI
               </Button>
+              <ResumePreparationButton
+                run={detail.resumable_prepare_run}
+                disabled={prepareMutation.isPending || resumePrepareMutation.isPending || !isAiConnected}
+                onResume={(runId) => void handleResumePrepare(runId)}
+              />
             </>
           )}
 

@@ -23,10 +23,15 @@ export async function apiClient<T = unknown>(
     requestHeaders['X-Job-Agent'] = 'local'
   }
 
-  let requestBody: string | undefined
+  let requestBody: BodyInit | undefined
   if (body !== undefined) {
-    requestHeaders['Content-Type'] = 'application/json'
-    requestBody = JSON.stringify(body)
+    if (typeof Blob !== 'undefined' && body instanceof Blob) {
+      requestHeaders['Content-Type'] = body.type || 'application/pdf'
+      requestBody = body
+    } else {
+      requestHeaders['Content-Type'] = 'application/json'
+      requestBody = JSON.stringify(body)
+    }
   }
 
   let res: Response

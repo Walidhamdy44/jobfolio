@@ -26,6 +26,24 @@ describe('apiClient', () => {
     expect(options.body).toBe(JSON.stringify({ name: 'test' }))
   })
 
+  it('sends PDF blobs as raw application/pdf bodies', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true }),
+    })
+    globalThis.fetch = fetchMock
+    const pdf = new Blob(['%PDF-1.4'], { type: 'application/pdf' })
+
+    await apiClient('/profile/master-cv', { method: 'POST', body: pdf })
+
+    const [url, options] = fetchMock.mock.calls[0]
+    expect(url).toBe('/api/profile/master-cv')
+    expect(options.headers['X-Job-Agent']).toBe('local')
+    expect(options.headers['Content-Type']).toBe('application/pdf')
+    expect(options.body).toBe(pdf)
+  })
+
   it('does not send X-Job-Agent header on GET requests', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
